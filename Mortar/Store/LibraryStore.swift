@@ -155,6 +155,17 @@ final class LibraryStore {
 
     func clearLogCache(repo: String) { exec("DELETE FROM log_cache WHERE repo_id = '\(escape(repo))'") }
 
+    func logCacheCount(repo: String) -> Int {
+        var statement: OpaquePointer?
+        var count = 0
+        if sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM log_cache WHERE repo_id = ?", -1, &statement, nil) == SQLITE_OK {
+            sqlite3_bind_text(statement, 1, repo, -1, SQLITE_TRANSIENT)
+            if sqlite3_step(statement) == SQLITE_ROW { count = Int(sqlite3_column_int(statement, 0)) }
+        }
+        sqlite3_finalize(statement)
+        return count
+    }
+
     func issueRules(repo: String) -> [IssueRule] {
         var statement: OpaquePointer?
         var rows: [IssueRule] = []

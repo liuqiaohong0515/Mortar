@@ -4,13 +4,16 @@ import SwiftUI
 struct CompareView: View {
     @Bindable var model: AppModel
     @State private var mode = "side"
+    @State private var focus: Int?
+    @State private var showLegend = false
 
     var body: some View {
         VStack(spacing: 0) {
             if let document = model.compare {
-                HStack {
-                    Text(document.leftTitle).font(.caption)
+                HStack(spacing: 8) {
+                    revisionMenu(document.leftTitle, left: true)
                     Spacer()
+                    Text((document.path as NSString).lastPathComponent).font(.headline).lineLimit(1)
                     if document.leftImage != nil || document.rightImage != nil {
                         Picker("", selection: $mode) {
                             Text(model.t("compare.sideBySide")).tag("side")
@@ -19,26 +22,82 @@ struct CompareView: View {
                         }.pickerStyle(.segmented).frame(width: 280)
                     }
                     Spacer()
-                    Text(document.rightTitle).font(.caption)
+                    revisionMenu(document.rightTitle, left: false)
+                    Button(model.t("compare.previous")) { step(-1) }
+                    Button(model.t("compare.next")) { step(1) }
+                    Button(model.t("action.showAnnotations")) { showLegend.toggle() }
+                        .disabled((model.compare?.blame ?? []).isEmpty)
                 }
                 .padding(6)
+                if showLegend { legend }
                 if let left = document.leftImage, let right = document.rightImage, let a = NSImage(data: left), let b = NSImage(data: right) {
                     ImageCompare(left: a, right: b, mode: mode)
                 } else if document.leftText.utf8.contains(0) || document.rightText.utf8.contains(0) {
                     ContentUnavailableView(model.t("compare.binary"), systemImage: "doc")
                 } else {
-                    SideBySideDiff(rows: document.rows, path: document.path)
+                    SideBySideDiff(
+                        rows: document.rows,
+                        path: document.path,
+                        showNumbers: model.preferences.showLineNumbers,
+                        showInline: model.preferences.showInline,
+                        showInvisibles: model.preferences.showInvisibles,
+                        blame: model.preferences.showAnnotations ? document.blame : [],
+                        editable: document.editable,
+                        focus: focus,
+                        onApply: { model.discardHunk(at: $0) },
+                        onDiscard: { model.discardHunk(at: $0) }
+                    )
                 }
             } else {
                 ContentUnavailableView(model.t("empty.selectFile"), systemImage: "doc.text.magnifyingglass")
             }
         }
     }
+
+    private var legend: some View {
+        HStack(spacing: 16) {
+            Label(model.t("log.added"), systemImage: "circle.fill").foregroundStyle(.green)
+            Label(model.t("log.deleted"), systemImage: "circle.fill").foregroundStyle(.red)
+            Label(model.t("log.modified"), systemImage: "circle.fill").foregroundStyle(.orange)
+            Text(model.t("action.showAnnotations")).foregroundStyle(.secondary)
+        }
+        .font(.caption)
+        .padding(.bottom, 4)
+    }
+
+    private func revisionMenu(_ title: String, left: Bool) -> some View {
+        Menu(title) {
+            ForEach(["BASE", "WORKING", "HEAD", "PREVIOUS"], id: \.self) { revision in
+                Button(revision) { Task { await model.setCompareRevision(left: left, revision: revision) } }
+            }
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+    }
+
+    private func step(_ direction: Int) {
+        let hunks = TextDiff.hunks(model.compare?.rows ?? [])
+        guard !hunks.isEmpty else { return }
+        let current = hunks.firstIndex { range in
+            if let focus { return range.contains(focus) }
+            return false
+        } ?? (direction > 0 ? -1 : hunks.count)
+        let next = min(max(current + direction, 0), hunks.count - 1)
+        focus = hunks[next].lowerBound
+    }
 }
 
 struct SideBySideDiff: View {
     var rows: [DiffRow]
     var path: String
+    var showNumbers = true
+    var showInline = true
+    var showInvisibles = false
+    var blame: [BlameLine] = []
+    var editable = false
+    var focus: Int?
+    var onApply: (Int) -> Void = { _ in }
+    var onDiscard: (Int) -> Void = { _ in }
 
     var body: some View {
         ScrollViewReader { proxy in
@@ -46,13 +105,19 @@ struct SideBySideDiff: View {
                 LazyVStack(alignment: .leading, spacing: 0) {
                     ForEach(rows) { row in
                         HStack(alignment: .top, spacing: 0) {
-                            line(row.left, number: row.leftNumber, kind: leftKind(row))
+                            line(display(row.left), number: row.leftNumber, kind: leftKind(row), other: row.right, blameLine: nil)
                             Rectangle().fill(Color(nsColor: .separatorColor)).frame(width: 1)
-                            line(row.right, number: row.rightNumber, kind: rightKind(row))
+                            line(display(row.right), number: row.rightNumber, kind: rightKind(row), other: row.left, blameLine: blame.first { $0.line == row.rightNumber })
+                            if editable, row.kind != .same {
+                                VStack(spacing: 2) {
+                                    Button("←") { if let hunk = hunkIndex(row) { onApply(hunk) } }
+                                    Button("×") { if let hunk = hunkIndex(row) { onDiscard(hunk) } }
+                                }
+                                .font(.caption2)
+                                .buttonStyle(.borderless)
+                            }
                             if row.kind != .same {
-                                Rectangle()
-                                    .fill(Color.green.opacity(0.85))
-                                    .frame(width: 3)
+                                Rectangle().fill(Color.green.opacity(0.85)).frame(width: 3)
                             } else {
                                 Color.clear.frame(width: 3)
                             }
@@ -61,12 +126,17 @@ struct SideBySideDiff: View {
                     }
                 }
             }
-            .onAppear {
-                if let first = rows.first(where: { $0.kind != .same })?.id {
-                    proxy.scrollTo(first, anchor: .center)
-                }
-            }
+            .onAppear { scroll(proxy, to: focus ?? rows.first { $0.kind != .same }?.id) }
+            .onChange(of: focus) { _, value in scroll(proxy, to: value) }
         }
+    }
+
+    private func scroll(_ proxy: ScrollViewProxy, to id: Int?) {
+        if let id { proxy.scrollTo(id, anchor: .center) }
+    }
+
+    private func hunkIndex(_ row: DiffRow) -> Int? {
+        TextDiff.hunks(rows).firstIndex { $0.contains(row.id) }
     }
 
     private func leftKind(_ row: DiffRow) -> DiffRow.Kind {
@@ -85,13 +155,27 @@ struct SideBySideDiff: View {
         }
     }
 
-    private func line(_ text: String, number: Int?, kind: DiffRow.Kind) -> some View {
+    private func display(_ text: String) -> String {
+        guard showInvisibles else { return text }
+        return text.replacingOccurrences(of: " ", with: "·").replacingOccurrences(of: "\t", with: "→")
+    }
+
+    private func line(_ text: String, number: Int?, kind: DiffRow.Kind, other: String, blameLine: BlameLine?) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Text(number.map(String.init) ?? "")
-                .font(.system(size: 11, design: .monospaced))
-                .foregroundStyle(.tertiary)
-                .frame(width: 36, alignment: .trailing)
-            Text(highlighted(text))
+            if showNumbers {
+                Text(number.map(String.init) ?? "")
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+                    .frame(width: 36, alignment: .trailing)
+            }
+            if let blameLine {
+                Text(blameLine.author)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 72, alignment: .leading)
+                    .lineLimit(1)
+            }
+            Text(highlighted(text, other: showInline && kind == .change ? other : nil))
                 .font(.system(size: 12, design: .monospaced))
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .textSelection(.enabled)
@@ -111,9 +195,37 @@ struct SideBySideDiff: View {
         }
     }
 
-    private func highlighted(_ line: String) -> AttributedString {
+    private func highlighted(_ line: String, other: String?) -> AttributedString {
         var text = AttributedString(line.isEmpty ? " " : line)
         text.foregroundColor = .primary
+        let source = line
+        for word in SyntaxColor.keywords(for: path) where word.count > 1 {
+            var search = source.startIndex
+            while let range = source.range(of: word, range: search..<source.endIndex) {
+                let before = range.lowerBound == source.startIndex || !source[source.index(before: range.lowerBound)].isLetter
+                let after = range.upperBound == source.endIndex || !source[range.upperBound].isLetter
+                if before && after, let lower = AttributedString.Index(range.lowerBound, within: text), let upper = AttributedString.Index(range.upperBound, within: text) {
+                    text[lower..<upper].foregroundColor = .purple
+                }
+                search = range.upperBound
+            }
+        }
+        if let other {
+            let limit = min(line.count, other.count)
+            let chars = Array(line)
+            let theirs = Array(other)
+            var i = 0
+            while i < limit, chars[i] == theirs[i] { i += 1 }
+            var j = 0
+            while j < limit - i, chars[chars.count - 1 - j] == theirs[theirs.count - 1 - j] { j += 1 }
+            if i < chars.count - j {
+                let start = line.index(line.startIndex, offsetBy: i)
+                let end = line.index(line.endIndex, offsetBy: -j)
+                if let lower = AttributedString.Index(start, within: text), let upper = AttributedString.Index(end, within: text), lower < upper {
+                    text[lower..<upper].backgroundColor = Color.yellow.opacity(0.45)
+                }
+            }
+        }
         return text
     }
 }
@@ -319,15 +431,18 @@ struct LogView: View {
                         .background(.quaternary, in: Capsule())
                 }
                 Spacer()
+                if workingRevision > 0, entry.revision < workingRevision {
+                    Button(model.t("log.revertTo")) { Task { await model.revertToRevision(entry.revision) } }
+                        .buttonStyle(.borderless)
+                }
+                Button(model.t("action.copyURL")) { copyLog(entry) }
+                    .buttonStyle(.borderless)
                 Text(meta(entry))
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
-            Text(entry.message.isEmpty ? " " : entry.message)
-                .font(.body)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .textSelection(.enabled)
+            linkedMessage(entry)
             DisclosureGroup(model.t("log.changes").uppercased()) {
                 VStack(alignment: .leading, spacing: 10) {
                     ForEach(changeGroups(entry), id: \.action) { group in
@@ -375,6 +490,48 @@ struct LogView: View {
         .background(model.selectedLogRevision == entry.revision ? Color.accentColor.opacity(0.08) : Color.clear)
         .contentShape(Rectangle())
         .onTapGesture { model.selectedLogRevision = entry.revision }
+    }
+
+    private func copyLog(_ entry: LogEntry) {
+        let date = entry.date?.formatted() ?? ""
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString("r\(entry.revision) \(entry.author) \(date)\n\(entry.message)", forType: .string)
+    }
+
+    private func linkedMessage(_ entry: LogEntry) -> some View {
+        let message = entry.message.isEmpty ? " " : entry.message
+        let rules = model.selectedRepository.map { model.library.issueRules(repo: $0.id) } ?? []
+        if let rule = rules.first, let regex = try? NSRegularExpression(pattern: rule.pattern) {
+            let ns = message as NSString
+            let matches = regex.matches(in: message, range: NSRange(location: 0, length: ns.length))
+            if !matches.isEmpty {
+                var pieces: [String] = []
+                var cursor = 0
+                for match in matches {
+                    if match.range.location > cursor {
+                        pieces.append(ns.substring(with: NSRange(location: cursor, length: match.range.location - cursor)))
+                    }
+                    pieces.append(ns.substring(with: match.range))
+                    cursor = match.range.location + match.range.length
+                }
+                if cursor < ns.length { pieces.append(ns.substring(from: cursor)) }
+                return AnyView(HStack(spacing: 0) {
+                    ForEach(Array(pieces.enumerated()), id: \.offset) { _, piece in
+                        if regex.firstMatch(in: piece, range: NSRange(location: 0, length: (piece as NSString).length)) != nil {
+                            let number = piece.filter(\.isNumber)
+                            if !number.isEmpty, let url = URL(string: rule.urlTemplate.replacingOccurrences(of: "{number}", with: number)) {
+                                Link(piece, destination: url)
+                            } else {
+                                Text(piece)
+                            }
+                        } else {
+                            Text(piece)
+                        }
+                    }
+                }.font(.body).frame(maxWidth: .infinity, alignment: .leading))
+            }
+        }
+        return AnyView(Text(message).font(.body).frame(maxWidth: .infinity, alignment: .leading).textSelection(.enabled))
     }
 
     private func changeGroups(_ entry: LogEntry) -> [(action: String, changes: [LogPathChange])] {
@@ -562,10 +719,10 @@ struct TimelineView: View {
                 ForEach(entries) { entry in
                     let selected = picks.contains(entry.revision)
                     Button { pick(entry.revision) } label: {
-                        Circle()
-                            .fill(selected ? Color.accentColor : Color(nsColor: .windowBackgroundColor))
-                            .overlay(Circle().stroke(selected ? Color.accentColor : Color.secondary, lineWidth: 1.5))
-                            .frame(width: 11, height: 11)
+                        let mark = symbol(for: entry)
+                        Image(systemName: mark.0)
+                            .foregroundStyle(selected ? Color.accentColor : mark.1)
+                            .font(.system(size: 12))
                     }
                     .buttonStyle(.plain)
                     .frame(width: slot)
@@ -588,14 +745,28 @@ struct TimelineView: View {
         .frame(height: 16)
     }
 
+    private func symbol(for entry: LogEntry) -> (String, Color) {
+        let path = model.selectedPaths.first ?? ""
+        let change = entry.changes.first { path.isEmpty || $0.path.hasSuffix(path) || path.hasSuffix($0.path) }
+        if let change, !change.copyFromPath.isEmpty { return ("arrow.triangle.branch", .purple) }
+        switch change?.action {
+        case "A": return ("plus.circle.fill", .green)
+        case "D": return ("minus.circle.fill", .red)
+        case "R": return ("arrow.triangle.2.circlepath", .orange)
+        case "M": return ("circle.fill", .blue)
+        default: return ("circle", .secondary)
+        }
+    }
+
     private func pick(_ revision: Int) {
-        if let index = picks.firstIndex(of: revision) {
-            picks.remove(at: index)
+        let extend = NSEvent.modifierFlags.contains(.command)
+        if picks.contains(revision) {
+            picks.removeAll { $0 == revision }
             compared = []
             return
         }
-        if picks.count == 2 { picks.removeFirst() }
-        picks.append(revision)
+        if !extend || picks.count >= 2 { picks = [revision] }
+        else { picks.append(revision) }
         guard picks.count == 2 else { compared = []; return }
         guard let path = model.selectedPaths.first, !path.isEmpty, let full = model.absolutePath(path) else { return }
         var isDirectory: ObjCBool = false
@@ -677,13 +848,38 @@ struct TranscriptView: View {
                     Text(entry.title).fontWeight(entry.ok ? .regular : .semibold)
                     if !entry.ok { Image(systemName: "exclamationmark.circle").foregroundStyle(.red) }
                 }
-                Text(entry.body).font(.system(size: 12, design: .monospaced)).lineLimit(6)
+                Text(coloredTranscript(entry.body))
+                    .font(.system(size: 12, design: .monospaced))
+                    .lineLimit(8)
                 if !entry.note.isEmpty { Text(entry.note).foregroundStyle(.secondary) }
             }
             .contextMenu {
                 Button(model.t("transcript.note")) { model.sheet = .note(entry.id) }
+                Button(model.t("action.showDifferences")) { showTranscriptDiff(entry) }
             }
         }
+    }
+
+    private func showTranscriptDiff(_ entry: TranscriptRecord) {
+        let numbers = entry.body.split { !$0.isNumber }.compactMap { Int($0) }
+        guard numbers.count >= 2 else { return }
+        Task { await model.compare(path: model.selectedPaths.first, left: "\(numbers[0])", right: "\(numbers[1])", switchMode: true) }
+    }
+
+    private func coloredTranscript(_ body: String) -> AttributedString {
+        var text = AttributedString(body)
+        let lines = body.split(separator: "\n", omittingEmptySubsequences: false)
+        var cursor = body.startIndex
+        for lineSub in lines {
+            let line = String(lineSub)
+            let end = body.index(cursor, offsetBy: line.count, limitedBy: body.endIndex) ?? body.endIndex
+            let color: Color? = line.contains("conflict") || line.hasPrefix("C ") ? .red : (line.hasPrefix("A ") || line.contains(" added") ? .green : (line.hasPrefix("D ") ? .secondary : nil))
+            if let color, let lower = AttributedString.Index(cursor, within: text), let upper = AttributedString.Index(end, within: text) {
+                text[lower..<upper].foregroundColor = color
+            }
+            cursor = end < body.endIndex ? body.index(after: end) : body.endIndex
+        }
+        return text
     }
 }
 
@@ -691,6 +887,8 @@ struct InspectorView: View {
     @Bindable var model: AppModel
     @State private var ignoreText = ""
     @State private var externals = ""
+    @State private var propName = ""
+    @State private var propValue = ""
 
     var body: some View {
         ScrollView {
@@ -713,14 +911,34 @@ struct InspectorView: View {
                     }
                     section("inspector.properties") {
                         ForEach(model.properties, id: \.name) { property in
-                            VStack(alignment: .leading) {
-                                Text(property.name).font(.caption).foregroundStyle(.secondary)
-                                Text(property.value).font(.system(.body, design: .monospaced)).textSelection(.enabled)
+                            HStack {
+                                VStack(alignment: .leading) {
+                                    Text(property.name).font(.caption).foregroundStyle(.secondary)
+                                    Text(property.value).font(.system(.body, design: .monospaced)).textSelection(.enabled)
+                                }
+                                Spacer()
+                                Button(model.t("action.delete")) { Task { await model.deleteProperty(property.name) } }
+                                    .buttonStyle(.borderless)
                             }
                         }
+                        if model.preferences.enableUserProperties {
+                            ForEach(model.library.userProperties().filter(\.enabled)) { item in
+                                Text(item.label.isEmpty ? item.name : item.label).font(.caption)
+                                Text(model.properties.first { $0.name == item.name }?.value ?? "").font(.callout)
+                            }
+                        }
+                        TextField(model.t("field.name"), text: $propName)
+                        TextField(model.t("field.value"), text: $propValue)
+                        Button(model.t("inspector.save")) { Task { await model.setProperty(propName, propValue) } }
                         TextField(model.t("inspector.externals"), text: $externals, axis: .vertical)
                         Button(model.t("inspector.save")) { Task { await model.saveExternals(externals) } }
                     }
+                    section("column.lock") {
+                        Text(model.properties.first { $0.name == "svn:lock" }?.value ?? model.rows.first { $0.path == model.selectedPaths.first }?.lock ?? "")
+                        Button(model.t("action.lock")) { Task { await model.lockSelected(comment: "", steal: false) } }
+                        Button(model.t("action.unlock")) { Task { await model.unlockSelected(force: false) } }
+                    }
+                    Button(model.t("pref.doubleClick.open")) { model.openEditor() }
                 }
             }
             .padding(12)

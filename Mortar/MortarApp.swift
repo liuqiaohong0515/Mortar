@@ -26,7 +26,8 @@ struct MortarCommands: Commands {
             Button(model.t("action.checkout")) { model.sheet = .checkout }.keyboardShortcut("o", modifiers: [.command, .option])
             Button(model.t("action.import")) { importFiles() }.keyboardShortcut("i", modifiers: [.command, .shift])
             Button(model.t("action.export")) { exportFiles() }.keyboardShortcut("e", modifiers: [.command, .shift])
-            Button(model.t("action.download")) { Task { await model.downloadSelection() } }
+            Button(model.t("action.savePatch")) { savePatch() }.keyboardShortcut("p", modifiers: [.command, .shift])
+            Button(model.t("pref.doubleClick.quickLook")) { model.quickLook() }.keyboardShortcut("y", modifiers: .command)
             Divider()
             Button(model.t("archive.export")) { model.sheet = .exportLibrary }
             Button(model.t("archive.import")) { model.sheet = .importLibrary }
@@ -61,7 +62,18 @@ struct MortarCommands: Commands {
                 model.prepareCommit()
             }.keyboardShortcut("t", modifiers: [.command, .option])
             Button(model.t("action.revert")) { Task { await model.revert(paths: []) } }.keyboardShortcut(.delete, modifiers: .command)
-            Button(model.t("action.resolve")) { model.sheet = .resolve }.keyboardShortcut("k", modifiers: .command)
+            Button(model.optionHeld ? model.t("action.compareExternal") : model.t("action.compareBase")) {
+                if model.optionHeld { model.compareExternal() } else { Task { await model.compareBase() } }
+            }.keyboardShortcut(.return, modifiers: .command)
+            Button(model.optionHeld ? model.t("action.compareExternal") : model.t("action.compareHead")) {
+                if model.optionHeld { model.compareExternal() } else { Task { await model.compareHead() } }
+            }.keyboardShortcut(.return, modifiers: [.command, .shift])
+            Button(model.optionHeld ? model.t("action.resolveTool") : model.t("action.resolve")) {
+                if model.optionHeld { model.resolveWithTool() } else { model.sheet = .resolve }
+            }.keyboardShortcut("k", modifiers: .command)
+            Button(model.t("action.lock")) { Task { await model.lockSelected(comment: "", steal: false) } }
+            Button(model.t("action.unlock")) { Task { await model.unlockSelected(force: false) } }
+            Button(model.t("action.repair")) { model.sheet = .repair }
             Button(model.t("action.add")) { Task { await model.addSelected() } }.keyboardShortcut("a", modifiers: [.command, .shift])
             Button(model.t("action.delete")) { Task { await model.deleteSelected(trash: true) } }.keyboardShortcut(.delete, modifiers: [.command, .option])
             Button(model.t("action.ignore")) { Task { await model.ignoreSelected() } }
@@ -69,8 +81,14 @@ struct MortarCommands: Commands {
             Button(model.t("action.merge")) { model.sheet = .merge }.keyboardShortcut("m", modifiers: [.command, .shift])
             Button(model.t("action.shelve")) { model.sheet = .shelve }
             Button(model.t("shelve.apply")) { model.sheet = .unshelve }
-            Button(model.t("action.compareBase")) { Task { await model.compareBase() } }.keyboardShortcut(.return, modifiers: .command)
-            Button(model.t("action.compareHead")) { Task { await model.compareHead() } }.keyboardShortcut(.return, modifiers: [.command, .shift])
+        }
+        CommandGroup(replacing: .help) {
+            Button(model.t("menu.help")) { model.sheet = .help }
+            Button(model.t("menu.svnHelp")) {
+                if let url = URL(string: "https://subversion.apache.org/docs/") {
+                    NSWorkspace.shared.open(url)
+                }
+            }
         }
         CommandMenu(model.t("menu.repository")) {
             Button(model.t("action.newFolder")) { Task { await model.makeDirectory("folder", message: "Create folder") } }
@@ -78,6 +96,14 @@ struct MortarCommands: Commands {
             Button(model.t("action.branch")) { model.sheet = .branch(false) }
             Button(model.t("action.copyURL")) { model.copyURL() }
             Button(model.t("action.issues")) { model.sheet = .issues }
+        }
+    }
+
+    private func savePatch() {
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "changes.diff"
+        if panel.runModal() == .OK, let url = panel.url {
+            Task { await model.savePatch(to: url) }
         }
     }
 

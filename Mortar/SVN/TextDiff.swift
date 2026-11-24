@@ -11,9 +11,16 @@ nonisolated struct DiffRow: Identifiable, Sendable {
 }
 
 nonisolated enum TextDiff {
-    static func rows(left: String, right: String) -> [DiffRow] {
-        let a = left.components(separatedBy: "\n")
-        let b = right.components(separatedBy: "\n")
+    struct Options: Sendable {
+        var foldWhitespace = false
+        var ignoreLineEndings = true
+    }
+
+    static func rows(left: String, right: String, options: Options = Options()) -> [DiffRow] {
+        let rawA = left.components(separatedBy: "\n")
+        let rawB = right.components(separatedBy: "\n")
+        let a = rawA.map { normalize($0, options) }
+        let b = rawB.map { normalize($0, options) }
         let ops = myers(a, b)
         var rows: [DiffRow] = []
         var leftNo = 1
@@ -23,7 +30,7 @@ nonisolated enum TextDiff {
         while i < ops.count {
             let op = ops[i]
             if op == .equal {
-                rows.append(DiffRow(id: index, kind: .same, left: a[leftNo - 1], right: b[rightNo - 1], leftNumber: leftNo, rightNumber: rightNo))
+                rows.append(DiffRow(id: index, kind: .same, left: rawA[leftNo - 1], right: rawB[rightNo - 1], leftNumber: leftNo, rightNumber: rightNo))
                 leftNo += 1
                 rightNo += 1
                 i += 1
@@ -33,12 +40,12 @@ nonisolated enum TextDiff {
             var deletes: [String] = []
             var inserts: [String] = []
             while i < ops.count, ops[i] == .delete {
-                deletes.append(a[leftNo - 1])
+                deletes.append(rawA[leftNo - 1])
                 leftNo += 1
                 i += 1
             }
             while i < ops.count, ops[i] == .insert {
-                inserts.append(b[rightNo - 1])
+                inserts.append(rawB[rightNo - 1])
                 rightNo += 1
                 i += 1
             }
@@ -57,6 +64,14 @@ nonisolated enum TextDiff {
             }
         }
         return rows
+    }
+
+    private static func normalize(_ line: String, _ options: Options) -> String {
+        var text = options.ignoreLineEndings ? line.replacingOccurrences(of: "\r", with: "") : line
+        if options.foldWhitespace {
+            text = text.replacingOccurrences(of: "[ \\t]+", with: " ", options: .regularExpression)
+        }
+        return text
     }
 
     static func hunks(_ rows: [DiffRow]) -> [Range<Int>] {
@@ -164,6 +179,11 @@ nonisolated enum SyntaxColor {
         "go": ["func", "return", "if", "else", "package", "import", "var", "type", "struct"],
         "rs": ["fn", "let", "mut", "return", "if", "else", "struct", "enum", "impl", "pub"],
         "sh": ["if", "then", "fi", "for", "while", "do", "done", "echo", "return"],
+        "html": ["html", "head", "body", "div", "span", "class", "href"],
+        "css": ["color", "margin", "padding", "display", "font", "background"],
+        "xml": ["xml", "version", "encoding"],
+        "md": ["the"],
+        "yaml": ["true", "false", "null"],
         "sql": ["select", "from", "where", "insert", "update", "delete", "create", "table", "and", "or"],
     ]
 
@@ -184,6 +204,11 @@ nonisolated enum SyntaxColor {
         case "sh", "bash": return languages["sh"] ?? []
         case "sql", "pks", "pkb": return languages["sql"] ?? []
         case "cs": return languages["cs"] ?? []
+        case "html", "htm": return languages["html"] ?? []
+        case "css": return languages["css"] ?? []
+        case "xml": return languages["xml"] ?? []
+        case "md", "markdown": return languages["md"] ?? []
+        case "yml", "yaml": return languages["yaml"] ?? []
         default: return []
         }
     }

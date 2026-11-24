@@ -35,6 +35,8 @@ enum WorkspaceSheet: Identifiable {
     case password
     case repair
     case note(String)
+    case networkVolume(String)
+    case help
 
     var id: String {
         switch self {
@@ -59,6 +61,8 @@ enum WorkspaceSheet: Identifiable {
         case .password: return "password"
         case .repair: return "repair"
         case .note(let id): return "note-\(id)"
+        case .networkVolume: return "network"
+        case .help: return "help"
         }
     }
 }
@@ -123,6 +127,8 @@ final class AppModel {
     var showExternals = true
     var showRepositoryStatus = false
     var showInspector = true
+    var optionHeld = false
+    var browserColumns: Set<String> = ["name", "revision", "author", "date", "size", "kind"]
     var selectedPaths: [String] = []
     var logs: [LogEntry] = []
     var selectedLogRevision: Int?
@@ -149,7 +155,46 @@ final class AppModel {
         let loaded = Preferences.load()
         preferences = loaded
         language = LanguageController(code: loaded.language)
+        if let saved = store.session("browser.columns"), !saved.isEmpty {
+            browserColumns = Set(saved.split(separator: ",").map(String.init))
+            browserColumns.insert("name")
+        }
+        if store.session("inspector") == "0" { showInspector = false }
         reloadLists()
+        if let raw = store.session("selection") {
+            if raw.hasPrefix("wc:"), workingCopies.contains(where: { $0.id == String(raw.dropFirst(3)) }) {
+                selection = .workingCopy(String(raw.dropFirst(3)))
+            } else if raw.hasPrefix("repo:"), repositories.contains(where: { $0.id == String(raw.dropFirst(5)) }) {
+                selection = .repository(String(raw.dropFirst(5)))
+            }
+        }
+    }
+
+    var orderedBrowserColumns: [String] {
+        let order = ["name", "revision", "author", "date", "size", "kind", "repos", "props", "lock", "depth"]
+        return order.filter { browserColumns.contains($0) || ($0 == "repos" && showRepositoryStatus) }
+    }
+
+    func toggleBrowserColumn(_ id: String) {
+        guard id != "name" else { return }
+        if browserColumns.contains(id) { browserColumns.remove(id) } else { browserColumns.insert(id) }
+        library.setSession("browser.columns", browserColumns.sorted().joined(separator: ","))
+    }
+
+    func receiveExternalDrop(_ urls: [URL]) {
+        for url in urls {
+            let svn = url.appendingPathComponent(".svn")
+            var isDir = ObjCBool(false)
+            if FileManager.default.fileExists(atPath: svn.path, isDirectory: &isDir) {
+                Task { await addWorkingCopy(at: url) }
+                continue
+            }
+            let format = url.appendingPathComponent("format")
+            let db = url.appendingPathComponent("db")
+            if FileManager.default.fileExists(atPath: format.path) || FileManager.default.fileExists(atPath: db.path) {
+                Task { await addFileRepository(path: url.path, nickname: url.lastPathComponent, create: false, compatibility: "", standardLayout: false) }
+            }
+        }
     }
 
     func t(_ key: String) -> String { language.t(key) }
@@ -177,6 +222,11 @@ final class AppModel {
 
     func select(_ selection: Selection) {
         self.selection = selection
+        switch selection {
+        case .workingCopy(let id): library.setSession("selection", "wc:\(id)")
+        case .repository(let id): library.setSession("selection", "repo:\(id)")
+        case .none: library.setSession("selection", "")
+        }
         browserRoot = ""
         selectedPaths = []
         mode = .browser
@@ -358,12 +408,31 @@ final class AppModel {
         activity = title
         defer { busy = false; activity = "" }
         let repository = repo ?? selectedRepository
-        let password = repository.flatMap { KeychainStore.load(account: $0.id) }
+        let password = repository.flatMap { savedPassword($0) }
         let username = resolvedUsername(repository)
-        let ssh = SSHOptions(port: preferences.sshPort, identityFile: preferences.sshIdentity, sendEnv: preferences.sshSendEnv, acceptNew: true)
+        var svnArgs = args
+        if tool == "svn" {
+            if !preferences.globalIgnores.isEmpty {
+                svnArgs.append(contentsOf: ["--config-option", "config:miscellany:global-ignores=\(preferences.globalIgnores)"])
+            }
+            svnArgs.append(contentsOf: ["--config-option", "config:miscellany:enable-auto-props=\(preferences.autoProps ? "yes" : "no")"])
+            svnArgs.append(contentsOf: ["--config-option", "config:miscellany:use-commit-times=\(preferences.useCommitTimes ? "yes" : "no")"])
+            if !preferences.useSharedSVNConfig {
+                let dir = (try? LibraryStore.supportDirectory())?.appendingPathComponent("svn-config", isDirectory: true)
+                if let dir {
+                    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+                    svnArgs.append(contentsOf: ["--config-dir", dir.path])
+                }
+            }
+        }
+        var identity = preferences.sshIdentity
+        if !preferences.useSharedSSH, identity.isEmpty, let dir = try? LibraryStore.supportDirectory() {
+            identity = dir.appendingPathComponent("ssh").path
+        }
+        let ssh = SSHOptions(port: preferences.sshPort, identityFile: identity, sendEnv: preferences.sshSendEnv, acceptNew: true)
         do {
             let output = try await SVNExecutor.shared.run(
-                tool: tool, arguments: args, workingDirectory: cwd,
+                tool: tool, arguments: svnArgs, workingDirectory: cwd,
                 username: username, password: password,
                 trustFailures: repository.map { library.isTrusted($0.url) } ?? false,
                 ssh: ssh
@@ -401,6 +470,15 @@ final class AppModel {
 
     func suggestedUsername() -> String {
         resolvedUsername(selectedRepository)
+    }
+
+    private func savedPassword(_ repository: RepoRecord) -> String? {
+        let named = keychainAccount(repository, resolvedUsername(repository))
+        return KeychainStore.load(account: named) ?? KeychainStore.load(account: repository.id)
+    }
+
+    func keychainAccount(_ repository: RepoRecord, _ username: String) -> String {
+        repository.url + "\n" + username
     }
 
     private func resolvedUsername(_ repository: RepoRecord?) -> String {

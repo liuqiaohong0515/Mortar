@@ -2,7 +2,11 @@ import AppKit
 import Foundation
 
 extension AppModel {
-    func addWorkingCopy(at url: URL) async {
+    func addWorkingCopy(at url: URL, forceNetwork: Bool = false) async {
+        if !forceNetwork, let values = try? url.resourceValues(forKeys: [.volumeIsLocalKey]), values.volumeIsLocal == false {
+            sheet = .networkVolume(url.path)
+            return
+        }
         var info = await invoke(args: ["info", url.path, "--xml"], title: t("action.addWorkingCopy"), reportError: false)
         if info == nil || info?.code != 0 {
             let upgraded = await invoke(args: ["upgrade", url.path], title: t("action.upgrade"), reportError: false)
@@ -312,6 +316,10 @@ extension AppModel {
         guard let wc = selectedWorkingCopy else { return }
         let relative = path ?? selectedPaths.first ?? ""
         guard !relative.isEmpty, let full = absolutePath(relative) else { return }
+        var isDirectory = ObjCBool(false)
+        if FileManager.default.fileExists(atPath: full, isDirectory: &isDirectory), isDirectory.boolValue {
+            return
+        }
         if isImage(full) {
             let leftData = await catData(full, revision: left, wc: wc)
             let rightData = right == "WORKING" ? (try? Data(contentsOf: URL(fileURLWithPath: full))) : await catData(full, revision: right, wc: wc)
@@ -323,11 +331,50 @@ extension AppModel {
         let rightText = right == "WORKING" ? (try? String(contentsOfFile: full, encoding: .utf8)) ?? "" : await cat(full, revision: right, wc: wc)
         compare = CompareDocument(
             path: relative, leftTitle: left, rightTitle: right, leftText: leftText, rightText: rightText,
-            leftImage: nil, rightImage: nil, rows: TextDiff.rows(left: leftText, right: rightText),
+            leftImage: nil, rightImage: nil, rows: TextDiff.rows(left: leftText, right: rightText, options: diffOptions()),
             editable: right == "WORKING", blame: []
         )
         if switchMode { mode = .compare }
         if preferences.showAnnotations { await loadBlame(full: full, wc: wc) }
+    }
+
+    func diffOptions() -> TextDiff.Options {
+        TextDiff.Options(foldWhitespace: !preferences.showWhitespace, ignoreLineEndings: !preferences.showLineEndings)
+    }
+
+    func setCompareRevision(left: Bool, revision: String) async {
+        guard var document = compare, let full = absolutePath(document.path) else { return }
+        let wc = selectedWorkingCopy
+        let text: String
+        if revision == "WORKING" {
+            text = (try? String(contentsOfFile: full, encoding: .utf8)) ?? ""
+        } else if let wc {
+            text = await cat(full, revision: revision, wc: wc)
+        } else {
+            return
+        }
+        if left {
+            document.leftText = text
+            document.leftTitle = revision
+        } else {
+            document.rightText = text
+            document.rightTitle = revision
+            document.editable = revision == "WORKING"
+        }
+        document.rows = TextDiff.rows(left: document.leftText, right: document.rightText, options: diffOptions())
+        compare = document
+    }
+
+    func compareExternal() {
+        guard let document = compare else { return }
+        let tool = preferences.compareTool.isEmpty ? "/usr/bin/opendiff" : preferences.compareTool
+        let leftURL = FileManager.default.temporaryDirectory.appendingPathComponent("mortar-left-\(document.path)")
+        let rightURL = FileManager.default.temporaryDirectory.appendingPathComponent("mortar-right-\(document.path)")
+        try? document.leftText.write(to: leftURL, atomically: true, encoding: .utf8)
+        try? document.rightText.write(to: rightURL, atomically: true, encoding: .utf8)
+        if FileManager.default.isExecutableFile(atPath: tool) {
+            Process.launchedProcess(launchPath: tool, arguments: [leftURL.path, rightURL.path])
+        }
     }
 
     func loadBlame(full: String, wc: WCRecord) async {
@@ -352,7 +399,7 @@ extension AppModel {
             }
         }
         document.rightText = rightLines.joined(separator: "\n")
-        document.rows = TextDiff.rows(left: document.leftText, right: document.rightText)
+        document.rows = TextDiff.rows(left: document.leftText, right: document.rightText, options: diffOptions())
         compare = document
         if let full = absolutePath(document.path) {
             try? document.rightText.write(toFile: full, atomically: true, encoding: .utf8)
@@ -362,7 +409,7 @@ extension AppModel {
     func saveWorkingText(_ text: String) {
         guard var document = compare, document.editable, let full = absolutePath(document.path) else { return }
         document.rightText = text
-        document.rows = TextDiff.rows(left: document.leftText, right: text)
+        document.rows = TextDiff.rows(left: document.leftText, right: text, options: diffOptions())
         compare = document
         try? text.write(toFile: full, atomically: true, encoding: .utf8)
     }
@@ -398,7 +445,7 @@ extension AppModel {
             rightText: rightText,
             leftImage: nil,
             rightImage: nil,
-            rows: TextDiff.rows(left: leftText, right: rightText),
+            rows: TextDiff.rows(left: leftText, right: rightText, options: diffOptions()),
             editable: false,
             blame: []
         )
@@ -417,7 +464,7 @@ extension AppModel {
             target = repositoryURL(repository, path: selectedPaths.first ?? browserRoot)
             repo = repository
         } else { return }
-        if let cachedRepo = repo {
+        if let cachedRepo = repo, library.session("logcache.off.\(cachedRepo.id)") != "1" {
             logs = library.cachedLogs(repo: cachedRepo.id, path: target)
         }
         guard let output = await invoke(args: ["log", "-v", "--xml", "-l", "200", target], repo: repo, title: t("view.log")), output.code == 0 else { return }
@@ -630,6 +677,20 @@ extension AppModel {
         sheet = nil
     }
 
+    func setProperty(_ name: String, _ value: String) async {
+        guard let wc = selectedWorkingCopy, let relative = selectedPaths.first, !name.isEmpty else { return }
+        let full = URL(fileURLWithPath: wc.path).appendingPathComponent(relative).path
+        _ = await invoke(args: ["propset", name, value, full], repo: repository(for: wc), title: t("inspector.save"))
+        await loadInspector(path: full)
+    }
+
+    func deleteProperty(_ name: String) async {
+        guard let wc = selectedWorkingCopy, let relative = selectedPaths.first else { return }
+        let full = URL(fileURLWithPath: wc.path).appendingPathComponent(relative).path
+        _ = await invoke(args: ["propdel", name, full], repo: repository(for: wc), title: t("action.delete"))
+        await loadInspector(path: full)
+    }
+
     func savePassword(_ password: String, username: String) {
         guard var repo = selectedRepository else { return }
         let name = username.trimmingCharacters(in: .whitespaces)
@@ -638,6 +699,7 @@ extension AppModel {
             library.save(repo: repo)
             reloadLists()
         }
+        KeychainStore.save(account: keychainAccount(repo, name), secret: password)
         KeychainStore.save(account: repo.id, secret: password)
         sheet = nil
         let reopenLog = mode == .log || mode == .timeline

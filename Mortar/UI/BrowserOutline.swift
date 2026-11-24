@@ -19,6 +19,9 @@ struct BrowserOutline: NSViewRepresentable {
         outline.doubleAction = #selector(Coordinator.open(_:))
         outline.target = context.coordinator
         outline.menu = context.coordinator.menu()
+        outline.registerForDraggedTypes([.fileURL])
+        outline.setDraggingSourceOperationMask([.copy, .move], forLocal: true)
+        outline.setDraggingSourceOperationMask(.copy, forLocal: false)
         context.coordinator.installColumns(on: outline)
         let scroll = NSScrollView()
         scroll.documentView = outline
@@ -34,14 +37,14 @@ struct BrowserOutline: NSViewRepresentable {
         context.coordinator.root = root
         context.coordinator.rows = rows
         if let outline = context.coordinator.outline {
-            context.coordinator.retitle(outline)
+            context.coordinator.syncColumns(outline)
             outline.reloadData()
         }
     }
 
     func makeCoordinator() -> Coordinator { Coordinator(model: model, root: root, rows: rows) }
 
-    final class Coordinator: NSObject, NSOutlineViewDataSource, NSOutlineViewDelegate {
+    final class Coordinator: NSObject, NSOutlineViewDataSource, NSOutlineViewDelegate, NSMenuDelegate {
         var model: AppModel
         var root: String
         var rows: [BrowserRow]
@@ -54,22 +57,49 @@ struct BrowserOutline: NSViewRepresentable {
         }
 
         func installColumns(on outline: NSOutlineView) {
-            let specs: [(String, CGFloat, Bool)] = [
-                ("name", 280, true),
-                ("date", 168, false),
-                ("size", 72, false),
-                ("kind", 128, false),
-            ]
-            for spec in specs {
-                let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(spec.0))
-                column.title = title(spec.0)
-                column.minWidth = spec.2 ? 160 : spec.1
-                column.width = spec.1
-                if !spec.2 { column.maxWidth = spec.0 == "kind" ? 220 : spec.1 + 40 }
-                column.resizingMask = spec.2 ? .autoresizingMask : []
+            rebuildColumns(on: outline)
+        }
+
+        func syncColumns(_ outline: NSOutlineView) {
+            let wanted = model.orderedBrowserColumns
+            let current = outline.tableColumns.map(\.identifier.rawValue)
+            if current != wanted { rebuildColumns(on: outline) }
+            else { retitle(outline); refreshHeaderMenu(outline) }
+        }
+
+        private func rebuildColumns(on outline: NSOutlineView) {
+            for column in outline.tableColumns { outline.removeTableColumn(column) }
+            for id in model.orderedBrowserColumns {
+                let flexible = id == "name"
+                let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(id))
+                column.title = title(id)
+                column.minWidth = flexible ? 160 : 64
+                column.width = flexible ? 280 : (id == "kind" || id == "date" ? 140 : 88)
+                if !flexible { column.maxWidth = id == "kind" ? 220 : 180 }
+                column.resizingMask = flexible ? .autoresizingMask : []
                 outline.addTableColumn(column)
             }
             outline.outlineTableColumn = outline.tableColumns.first
+            refreshHeaderMenu(outline)
+        }
+
+        private func refreshHeaderMenu(_ outline: NSOutlineView) {
+            let menu = NSMenu()
+            menu.delegate = self
+            for id in ["repos", "props", "lock", "depth"] {
+                let item = NSMenuItem(title: title(id), action: #selector(toggleColumn(_:)), keyEquivalent: "")
+                item.representedObject = id
+                item.target = self
+                item.state = model.browserColumns.contains(id) ? .on : .off
+                menu.addItem(item)
+            }
+            outline.headerView?.menu = menu
+        }
+
+        @objc func toggleColumn(_ sender: NSMenuItem) {
+            guard let id = sender.representedObject as? String else { return }
+            model.toggleBrowserColumn(id)
+            if let outline { syncColumns(outline); outline.reloadData() }
         }
 
         func retitle(_ outline: NSOutlineView) {
@@ -83,6 +113,12 @@ struct BrowserOutline: NSViewRepresentable {
             case "name": return model.t("column.name")
             case "date": return model.t("column.date")
             case "size": return model.t("column.size")
+            case "revision": return model.t("column.revision")
+            case "author": return model.t("column.author")
+            case "repos": return model.t("column.repos")
+            case "props": return model.t("column.props")
+            case "lock": return model.t("column.lock")
+            case "depth": return model.t("column.depth")
             default: return model.t("column.kind")
             }
         }
@@ -122,6 +158,18 @@ struct BrowserOutline: NSViewRepresentable {
                 text.stringValue = model.browserDate(row.date)
             case "size":
                 text.stringValue = row.isDirectory ? "--" : model.formattedSize(row.size)
+            case "revision":
+                text.stringValue = row.revision
+            case "author":
+                text.stringValue = row.author
+            case "repos":
+                text.stringValue = row.reposItem == "none" ? "" : row.reposItem
+            case "props":
+                text.stringValue = row.props == "none" || row.props == "normal" ? "" : row.props
+            case "lock":
+                text.stringValue = row.lock
+            case "depth":
+                text.stringValue = row.depth
             default:
                 text.stringValue = fileKind(row)
             }
@@ -163,6 +211,47 @@ struct BrowserOutline: NSViewRepresentable {
         @objc func revert(_ sender: Any?) { Task { await model.revert(paths: model.selectedPaths) } }
         @objc func compare(_ sender: Any?) { Task { await model.compareBase() } }
         @objc func showLog(_ sender: Any?) { Task { await model.loadLog() } }
+
+        func outlineView(_ outlineView: NSOutlineView, pasteboardWriterForItem item: Any) -> NSPasteboardWriting? {
+            guard let row = item as? BrowserRow, let full = model.absolutePath(row.path) else { return nil }
+            return NSURL(fileURLWithPath: full)
+        }
+
+        func outlineView(_ outlineView: NSOutlineView, validateDrop info: NSDraggingInfo, proposedItem item: Any?, proposedChildIndex index: Int) -> NSDragOperation {
+            info.draggingSourceOperationMask.contains(.copy) ? .copy : .move
+        }
+
+        func outlineView(_ outlineView: NSOutlineView, acceptDrop info: NSDraggingInfo, item: Any?, childIndex index: Int) -> Bool {
+            guard let urls = info.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: nil) as? [URL], !urls.isEmpty else { return false }
+            let inside = urls.allSatisfy { url in
+                guard let wc = model.selectedWorkingCopy else { return false }
+                return url.path.hasPrefix(wc.path + "/") || url.path == wc.path
+            }
+            if !inside || model.selectedWorkingCopy == nil {
+                model.receiveExternalDrop(urls)
+                return true
+            }
+            let destination = (item as? BrowserRow)?.path ?? root
+            let copy = info.draggingSourceOperationMask.contains(.copy)
+            guard let wc = model.selectedWorkingCopy else { return false }
+            for url in urls {
+                let relative = String(url.path.dropFirst(wc.path.count)).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+                guard !relative.isEmpty else { continue }
+                let name = (relative as NSString).lastPathComponent
+                let dest = destination.isEmpty ? name : destination + "/" + name
+                if copy { Task { await model.copyItem(from: relative, to: dest) } }
+                else { Task { await model.move(from: relative, to: dest) } }
+            }
+            return true
+        }
+
+        func menuNeedsUpdate(_ menu: NSMenu) {
+            for item in menu.items {
+                if let id = item.representedObject as? String {
+                    item.state = model.browserColumns.contains(id) ? .on : .off
+                }
+            }
+        }
 
         private func opensAsFile(_ row: BrowserRow) -> Bool {
             let ext = (row.name as NSString).pathExtension.lowercased()

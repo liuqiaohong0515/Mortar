@@ -28,6 +28,28 @@ struct SheetRouter: View {
         case .password: PasswordSheet(model: model)
         case .repair: RepairSheet(model: model)
         case .note(let id): NoteSheet(model: model, id: id)
+        case .networkVolume(let path):
+            VStack(alignment: .leading, spacing: 12) {
+                Text(model.t("network.warning"))
+                HStack {
+                    Button(model.t("action.cancel")) { model.sheet = nil }
+                    Spacer()
+                    Button(model.t("action.ok")) {
+                        model.sheet = nil
+                        Task { await model.addWorkingCopy(at: URL(fileURLWithPath: path), forceNetwork: true) }
+                    }
+                }
+            }
+            .padding(20)
+            .frame(width: 420)
+        case .help:
+            VStack(alignment: .leading, spacing: 8) {
+                Text(model.t("menu.help")).font(.title3)
+                Text(model.t("timeline.prompt"))
+                Button(model.t("action.ok")) { model.sheet = nil }
+            }
+            .padding(20)
+            .frame(width: 420)
         }
     }
 }
@@ -144,6 +166,7 @@ struct CommitSheet: View {
     @Bindable var model: AppModel
     @State private var message = ""
     @State private var unlock = true
+    @State private var postScript = ""
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -151,12 +174,20 @@ struct CommitSheet: View {
             VStack(alignment: .leading) {
                 Text(model.t("commit.title")).font(.title3)
                 TextEditor(text: $message).font(.system(size: model.preferences.commitLogFontSize, design: .monospaced)).frame(minHeight: 160)
+                if !model.logs.isEmpty {
+                    Menu(model.t("log.copy")) {
+                        ForEach(model.logs.prefix(6)) { entry in
+                            Button(entry.message.isEmpty ? "r\(entry.revision)" : entry.message) { message = entry.message }
+                        }
+                    }
+                }
+                TextField(model.t("commit.postScript"), text: $postScript)
                 Toggle(model.t("commit.unlock"), isOn: $unlock)
                 HStack {
                     Button(model.t("action.cancel")) { model.logDraft = message; dismiss() }
                     Spacer()
                     Button(model.t("commit.button")) {
-                        Task { await model.commit(message: message, unlock: unlock, preScript: model.preferences.preCommitScript, postScript: "") }
+                        Task { await model.commit(message: message, unlock: unlock, preScript: model.preferences.preCommitScript, postScript: postScript) }
                     }.keyboardShortcut(.defaultAction)
                 }
             }.frame(minWidth: 280)
@@ -175,6 +206,7 @@ struct CommitSheet: View {
 struct UpdateSheet: View {
     @Bindable var model: AppModel
     @State private var revision = "HEAD"
+    @State private var depth = ""
     @State private var externals = true
     @Environment(\.dismiss) private var dismiss
 
@@ -182,11 +214,12 @@ struct UpdateSheet: View {
         VStack(alignment: .leading) {
             Text(model.t("action.update")).font(.title3)
             TextField(model.t("field.revision"), text: $revision)
+            TextField(model.t("column.depth"), text: $depth)
             Toggle(model.t("field.includeExternals"), isOn: $externals)
             HStack {
                 Button(model.t("action.cancel")) { dismiss() }
                 Spacer()
-                Button(model.t("action.update")) { Task { await model.update(revision: revision, depth: nil, externals: externals); dismiss() } }
+                Button(model.t("action.update")) { Task { await model.update(revision: revision, depth: depth.isEmpty ? nil : depth, externals: externals); dismiss() } }
             }
         }.padding(20).frame(width: 420)
     }
@@ -218,6 +251,9 @@ struct MergeSheet: View {
             Toggle(model.t("merge.ignoreWhitespace"), isOn: $ignoreWhitespace)
             Toggle(model.t("merge.ignoreAncestry"), isOn: $ignoreAncestry).disabled(strategy == "reintegrate")
             Toggle(model.t("merge.recordOnly"), isOn: $recordOnly)
+            if model.rows.contains(where: { !$0.letter.isEmpty && $0.letter != "X" && $0.letter != "I" }) {
+                Text(model.t("merge.localChanges")).foregroundStyle(.orange).font(.caption)
+            }
             HStack {
                 Button(model.t("merge.dryRun")) { run(dry: true) }
                 Spacer()
@@ -442,8 +478,14 @@ struct ResolveSheet: View {
     var body: some View {
         VStack(alignment: .leading) {
             Text(model.t("action.resolve")).font(.title3)
+            Text(model.t("log.modified")).font(.caption).foregroundStyle(.secondary)
             Button(model.t("action.resolveMine")) { Task { await model.resolve(accept: "mine-full"); dismiss() } }
             Button(model.t("action.resolveTheirs")) { Task { await model.resolve(accept: "theirs-full"); dismiss() } }
+            Text(model.t("column.props")).font(.caption).foregroundStyle(.secondary)
+            Button(model.t("action.resolveMine")) { Task { await model.resolve(accept: "mine-conflict"); dismiss() } }
+            Button(model.t("action.resolveTheirs")) { Task { await model.resolve(accept: "theirs-conflict"); dismiss() } }
+            Text(model.t("column.kind")).font(.caption).foregroundStyle(.secondary)
+            Button(model.t("action.resolveWorking")) { Task { await model.resolve(accept: "working"); dismiss() } }
             Button(model.t("action.resolveBase")) { Task { await model.resolve(accept: "base"); dismiss() } }
             Button(model.t("action.resolveWorking")) { Task { await model.resolve(accept: "working"); dismiss() } }
             Button(model.t("action.resolveTool")) { model.resolveWithTool() }

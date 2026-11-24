@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct MainWindow: View {
     @Bindable var model: AppModel
@@ -19,6 +20,11 @@ struct MainWindow: View {
         .navigationTitle("Mortar")
         .toolbar { toolbarContent }
         .background(ToolbarIconAndLabel())
+        .background(WindowFrameMemory(model: model))
+        .background(OptionKeyMonitor(held: $model.optionHeld))
+        .onChange(of: model.showInspector) { _, shown in
+            model.library.setSession("inspector", shown ? "1" : "0")
+        }
         .frame(minWidth: 1180, minHeight: 640)
         .alert(model.t("error.svnFailed"), isPresented: Binding(get: { model.errorMessage != nil }, set: { if !$0 { model.errorMessage = nil } })) {
             Button(model.t("action.ok"), role: .cancel) { model.errorMessage = nil }
@@ -317,6 +323,51 @@ struct MainWindow: View {
     }
 }
 
+private struct WindowFrameMemory: NSViewRepresentable {
+    var model: AppModel
+    func makeNSView(context: Context) -> NSView { NSView() }
+    func updateNSView(_ nsView: NSView, context: Context) {
+        DispatchQueue.main.async {
+            guard let window = nsView.window else { return }
+            if !context.coordinator.restored, let raw = model.library.session("window.frame") {
+                let parts = raw.split(separator: ",").compactMap { Double($0) }
+                if parts.count == 4 {
+                    window.setFrame(NSRect(x: parts[0], y: parts[1], width: parts[2], height: parts[3]), display: false)
+                }
+                context.coordinator.restored = true
+                NotificationCenter.default.addObserver(forName: NSWindow.didMoveNotification, object: window, queue: .main) { _ in
+                    save(window)
+                }
+                NotificationCenter.default.addObserver(forName: NSWindow.didResizeNotification, object: window, queue: .main) { _ in
+                    save(window)
+                }
+            }
+        }
+    }
+    func makeCoordinator() -> Coordinator { Coordinator() }
+    private func save(_ window: NSWindow) {
+        let frame = window.frame
+        model.library.setSession("window.frame", "\(frame.origin.x),\(frame.origin.y),\(frame.size.width),\(frame.size.height)")
+    }
+    final class Coordinator { var restored = false }
+}
+
+private struct OptionKeyMonitor: NSViewRepresentable {
+    @Binding var held: Bool
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView()
+        context.coordinator.monitor = NSEvent.addLocalMonitorForEvents(matching: .flagsChanged) { [weak view] event in
+            let down = event.modifierFlags.contains(.option)
+            DispatchQueue.main.async { view?.window.map { _ in self.held = down } }
+            return event
+        }
+        return view
+    }
+    func updateNSView(_ nsView: NSView, context: Context) {}
+    func makeCoordinator() -> Coordinator { Coordinator() }
+    final class Coordinator { var monitor: Any? }
+}
+
 private struct ToolbarIconAndLabel: NSViewRepresentable {
     func makeNSView(context: Context) -> NSView { NSView() }
 
@@ -480,6 +531,22 @@ struct SourceListView: View {
             .padding(.horizontal, 10)
             .padding(.vertical, 8)
             .frame(maxWidth: .infinity, alignment: .leading)
+            .onDrop(of: [.fileURL], isTargeted: nil) { providers in
+                Task {
+                    var urls: [URL] = []
+                    for provider in providers {
+                        if let url = try? await provider.loadItem(forTypeIdentifier: "public.file-url") as? URL {
+                            urls.append(url)
+                        } else if let data = try? await provider.loadItem(forTypeIdentifier: "public.file-url") as? Data,
+                                  let string = String(data: data, encoding: .utf8),
+                                  let url = URL(string: string) {
+                            urls.append(url)
+                        }
+                    }
+                    model.receiveExternalDrop(urls)
+                }
+                return true
+            }
         }
         .frame(minWidth: 0, maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
         .background(SidebarFrameProbe())
@@ -540,6 +607,13 @@ struct SourceListView: View {
     @ViewBuilder private func repositoryMenu(_ repo: RepoRecord) -> some View {
         Button(model.t("action.copyURL")) { model.copyURL() }
         Button(model.t("action.issues")) { model.sheet = .issues }
+        Button(model.library.session("logcache.off.\(repo.id)") == "1" ? model.t("filter.all") : model.t("log.cacheClear")) {
+            let key = "logcache.off.\(repo.id)"
+            model.library.setSession(key, model.library.session(key) == "1" ? "0" : "1")
+        }
+        Button("\(model.t("log.cacheClear")) (\(model.library.logCacheCount(repo: repo.id)))") {
+            model.library.clearLogCache(repo: repo.id)
+        }
         Button(model.t("action.removeFromList")) { model.removeSelection() }
     }
 }
