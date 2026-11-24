@@ -1,0 +1,10 @@
+Mortar 自身的源代码以 MIT 许可证发布（见 LICENSE），可以自由使用、修改、再分发和商用。
+
+Vendor/svn 与 Mortar/SVN.bundle 是随附的第三方二进制，不在上述 MIT 许可证范围内，各自保留原许可证。其中包含：
+
+- Apache Subversion 1.15.0，以及 APR、APR-Util、serf（Apache License 2.0）
+- lz4、utf8proc
+- gettext 的 libintl
+- libssl / libcrypto
+
+这些组件可以商用，但须遵守各自许可证。
