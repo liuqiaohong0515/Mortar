@@ -8,7 +8,6 @@ struct SheetRouter: View {
     var body: some View {
         switch sheet {
         case .addRepository: AddRepositorySheet(model: model)
-        case .addWorkingCopy: FolderSheet(model: model, title: model.t("action.addWorkingCopy")) { url in Task { await model.addWorkingCopy(at: url) } }
         case .checkout: CheckoutSheet(model: model)
         case .commit: CommitSheet(model: model)
         case .update: UpdateSheet(model: model)
@@ -45,11 +44,17 @@ struct SheetRouter: View {
         case .help:
             VStack(alignment: .leading, spacing: 8) {
                 Text(model.t("menu.help")).font(.title3)
-                Text(model.t("timeline.prompt"))
+                Text("Mortar 用来检出、更新、比较、提交和合并 Subversion 工作副本。左侧选择仓库或工作副本，双击文件夹进入，双击文件按偏好打开。比较视图可以切换 BASE、WORKING 和 HEAD。")
+                    .fixedSize(horizontal: false, vertical: true)
+                ScrollView {
+                    Text(model.svnHelpText).font(.system(size: 12, design: .monospaced)).frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(height: 220)
+                Button(model.t("menu.svnHelp")) { Task { await model.loadSVNHelp() } }
                 Button(model.t("action.ok")) { model.sheet = nil }
             }
             .padding(20)
-            .frame(width: 420)
+            .frame(width: 520)
         }
     }
 }
@@ -234,6 +239,8 @@ struct MergeSheet: View {
     @State private var ignoreWhitespace = false
     @State private var ignoreAncestry = false
     @State private var recordOnly = false
+    @State private var chosen: Set<Int> = []
+    @State private var preview = ""
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -246,28 +253,54 @@ struct MergeSheet: View {
                 Text(model.t("merge.advanced")).tag("advanced")
             }.pickerStyle(.segmented)
             TextField(model.t("merge.source"), text: $source)
-            if strategy == "cherry" { TextField(model.t("field.revision"), text: $revisions) }
+            if strategy == "cherry" {
+                List(model.logs) { entry in
+                    Toggle(isOn: Binding(get: { chosen.contains(entry.revision) }, set: { on in
+                        if on { chosen.insert(entry.revision) } else { chosen.remove(entry.revision) }
+                    })) {
+                        Text("r\(entry.revision)  \(entry.message)").lineLimit(1)
+                    }
+                }
+                .frame(height: 160)
+            }
             if strategy == "advanced" { TextField(model.t("field.url"), text: $second) }
             Toggle(model.t("merge.ignoreWhitespace"), isOn: $ignoreWhitespace)
             Toggle(model.t("merge.ignoreAncestry"), isOn: $ignoreAncestry).disabled(strategy == "reintegrate")
             Toggle(model.t("merge.recordOnly"), isOn: $recordOnly)
             if model.rows.contains(where: { !$0.letter.isEmpty && $0.letter != "X" && $0.letter != "I" }) {
                 Text(model.t("merge.localChanges")).foregroundStyle(.orange).font(.caption)
+                HStack {
+                    Button(model.t("action.commit")) { model.prepareCommit(); dismiss() }
+                    Button(model.t("action.revert")) { Task { await model.revert(paths: []) } }
+                    Button(model.t("action.updateToLatest")) { Task { await model.update(revision: "HEAD", depth: nil, externals: true) } }
+                }
+            }
+            if !preview.isEmpty {
+                ScrollView {
+                    Text(preview).font(.system(size: 11, design: .monospaced)).frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: 160)
             }
             HStack {
                 Button(model.t("merge.dryRun")) { run(dry: true) }
                 Spacer()
                 Button(model.t("action.cancel")) { dismiss() }
-                Button(model.t("merge.button")) { run(dry: false) }.keyboardShortcut(.defaultAction)
+                Button(model.t("merge.button")) { run(dry: false) }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(preview.isEmpty)
             }
         }.padding(20).frame(width: 520)
     }
 
     private func run(dry: Bool) {
-        let revs = revisions.split(separator: ",").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+        let revs = chosen.isEmpty ? revisions.split(separator: ",").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) } : chosen.sorted()
         Task {
-            await model.merge(strategy: strategy, source: source, revisions: revs, secondURL: second, secondRevision: "HEAD", depth: "infinity", ignoreWhitespace: ignoreWhitespace, ignoreEOL: false, ignoreAncestry: ignoreAncestry, recordOnly: recordOnly, dryRun: dry)
-            if !dry { dismiss() }
+            let text = await model.merge(strategy: strategy, source: source, revisions: revs, secondURL: second, secondRevision: "HEAD", depth: "infinity", ignoreWhitespace: ignoreWhitespace, ignoreEOL: false, ignoreAncestry: ignoreAncestry, recordOnly: recordOnly, dryRun: dry)
+            if dry {
+                preview = text.isEmpty ? "—" : text
+            } else {
+                dismiss()
+            }
         }
     }
 }
@@ -478,19 +511,29 @@ struct ResolveSheet: View {
     var body: some View {
         VStack(alignment: .leading) {
             Text(model.t("action.resolve")).font(.title3)
-            Text(model.t("log.modified")).font(.caption).foregroundStyle(.secondary)
-            Button(model.t("action.resolveMine")) { Task { await model.resolve(accept: "mine-full"); dismiss() } }
-            Button(model.t("action.resolveTheirs")) { Task { await model.resolve(accept: "theirs-full"); dismiss() } }
-            Text(model.t("column.props")).font(.caption).foregroundStyle(.secondary)
-            Button(model.t("action.resolveMine")) { Task { await model.resolve(accept: "mine-conflict"); dismiss() } }
-            Button(model.t("action.resolveTheirs")) { Task { await model.resolve(accept: "theirs-conflict"); dismiss() } }
-            Text(model.t("column.kind")).font(.caption).foregroundStyle(.secondary)
-            Button(model.t("action.resolveWorking")) { Task { await model.resolve(accept: "working"); dismiss() } }
-            Button(model.t("action.resolveBase")) { Task { await model.resolve(accept: "base"); dismiss() } }
-            Button(model.t("action.resolveWorking")) { Task { await model.resolve(accept: "working"); dismiss() } }
+            if conflictKind == "prop" {
+                Text(model.t("column.props")).font(.caption).foregroundStyle(.secondary)
+                Button(model.t("action.resolveMine")) { Task { await model.resolve(accept: "mine-conflict"); dismiss() } }
+                Button(model.t("action.resolveTheirs")) { Task { await model.resolve(accept: "theirs-conflict"); dismiss() } }
+            } else if conflictKind == "tree" {
+                Text(model.t("column.kind")).font(.caption).foregroundStyle(.secondary)
+                Button(model.t("action.resolveWorking")) { Task { await model.resolve(accept: "working"); dismiss() } }
+            } else {
+                Text(model.t("log.modified")).font(.caption).foregroundStyle(.secondary)
+                Button(model.t("action.resolveMine")) { Task { await model.resolve(accept: "mine-full"); dismiss() } }
+                Button(model.t("action.resolveTheirs")) { Task { await model.resolve(accept: "theirs-full"); dismiss() } }
+                Button(model.t("action.resolveBase")) { Task { await model.resolve(accept: "base"); dismiss() } }
+            }
             Button(model.t("action.resolveTool")) { model.resolveWithTool() }
             Button(model.t("action.cancel")) { dismiss() }
         }.padding(20).frame(width: 360)
+    }
+
+    private var conflictKind: String {
+        guard let path = model.selectedPaths.first, let row = model.rows.first(where: { $0.path == path }) else { return "text" }
+        if row.props == "conflicted", row.item != "conflicted" { return "prop" }
+        if row.item == "missing" || row.letter == "C", row.item != "conflicted" { return "tree" }
+        return "text"
     }
 }
 
@@ -584,25 +627,6 @@ struct TextPrompt: View {
                 Button(confirmTitle) { onSubmit(text); dismiss() }
             }
         }.padding(20).frame(width: 440)
-    }
-}
-
-struct FolderSheet: View {
-    var model: AppModel
-    var title: String
-    var onPick: (URL) -> Void
-    @Environment(\.dismiss) private var dismiss
-    var body: some View {
-        VStack {
-            Text(title)
-            Button(model.t("action.browse")) {
-                let panel = NSOpenPanel()
-                panel.canChooseDirectories = true
-                panel.canChooseFiles = false
-                if panel.runModal() == .OK, let url = panel.url { onPick(url); dismiss() }
-            }
-            Button(model.t("action.cancel")) { dismiss() }
-        }.padding(20)
     }
 }
 

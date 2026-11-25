@@ -1,12 +1,33 @@
 import SwiftUI
+import AppKit
+
+final class MortarDelegate: NSObject, NSApplicationDelegate {
+    weak var model: AppModel?
+    var waitingToQuit = false
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard let model, model.busy else { return .terminateNow }
+        let alert = NSAlert()
+        alert.messageText = model.t("quit.busy")
+        alert.addButton(withTitle: model.t("quit.wait"))
+        alert.addButton(withTitle: model.t("action.cancel"))
+        if alert.runModal() == .alertFirstButtonReturn {
+            waitingToQuit = true
+            return .terminateLater
+        }
+        return .terminateCancel
+    }
+}
 
 @main
 struct MortarApp: App {
+    @NSApplicationDelegateAdaptor(MortarDelegate.self) private var delegate
     @State private var model = AppModel()
 
     var body: some Scene {
         WindowGroup {
             MainWindow(model: model)
+                .onAppear { delegate.model = model }
         }
         .windowToolbarStyle(.unified)
         .commands { MortarCommands(model: model) }
@@ -22,7 +43,7 @@ struct MortarCommands: Commands {
     var body: some Commands {
         CommandGroup(replacing: .newItem) {
             Button(model.t("action.addRepository")) { model.sheet = .addRepository }.keyboardShortcut("n", modifiers: [.command, .option])
-            Button(model.t("action.addWorkingCopy")) { model.sheet = .addWorkingCopy }.keyboardShortcut("n", modifiers: [.command, .shift])
+            Button(model.t("action.addWorkingCopy")) { model.pickWorkingCopy() }.keyboardShortcut("n", modifiers: [.command, .shift])
             Button(model.t("action.checkout")) { model.sheet = .checkout }.keyboardShortcut("o", modifiers: [.command, .option])
             Button(model.t("action.import")) { importFiles() }.keyboardShortcut("i", modifiers: [.command, .shift])
             Button(model.t("action.export")) { exportFiles() }.keyboardShortcut("e", modifiers: [.command, .shift])
@@ -47,7 +68,7 @@ struct MortarCommands: Commands {
             Button(model.t("view.transcript")) { model.mode = .transcript }.keyboardShortcut("5", modifiers: .command)
             Divider()
             Button(model.t("action.refresh")) { Task { await model.refresh() } }.keyboardShortcut("r", modifiers: .command)
-            Button(model.t("action.showAll")) { model.filter = "all"; model.search = "" }.keyboardShortcut("\\", modifiers: .command)
+            Button(model.t("action.showAll")) { model.filter = "all"; model.filterLocked = false; model.search = "" }.keyboardShortcut("\\", modifiers: .command)
             Button(model.t("action.showIgnored")) { model.showIgnored.toggle(); Task { await model.refresh() } }
             Button(model.t("action.showExternals")) { model.showExternals.toggle(); Task { await model.refresh() } }
             Button(model.t("action.showRepositoryStatus")) { model.showRepositoryStatus.toggle(); Task { await model.refresh() } }
@@ -85,9 +106,8 @@ struct MortarCommands: Commands {
         CommandGroup(replacing: .help) {
             Button(model.t("menu.help")) { model.sheet = .help }
             Button(model.t("menu.svnHelp")) {
-                if let url = URL(string: "https://subversion.apache.org/docs/") {
-                    NSWorkspace.shared.open(url)
-                }
+                model.sheet = .help
+                Task { await model.loadSVNHelp() }
             }
         }
         CommandMenu(model.t("menu.repository")) {

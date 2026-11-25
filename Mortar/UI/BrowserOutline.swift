@@ -38,6 +38,9 @@ struct BrowserOutline: NSViewRepresentable {
         context.coordinator.rows = rows
         if let outline = context.coordinator.outline {
             context.coordinator.syncColumns(outline)
+            if let saved = context.coordinator.model.library.session("browser.scroll"), let y = Double(saved) {
+                outline.enclosingScrollView?.contentView.scroll(to: NSPoint(x: 0, y: y))
+            }
             outline.reloadData()
         }
     }
@@ -75,13 +78,33 @@ struct BrowserOutline: NSViewRepresentable {
                 column.title = title(id)
                 column.minWidth = flexible ? 160 : 64
                 column.width = flexible ? 280 : (id == "kind" || id == "date" ? 140 : 88)
+                if let saved = savedWidth(id) { column.width = saved }
                 if !flexible { column.maxWidth = id == "kind" ? 220 : 180 }
                 column.resizingMask = flexible ? .autoresizingMask : []
                 outline.addTableColumn(column)
             }
-            outline.outlineTableColumn = outline.tableColumns.first
-            refreshHeaderMenu(outline)
+        outline.outlineTableColumn = outline.tableColumns.first
+        NotificationCenter.default.addObserver(self, selector: #selector(columnResized(_:)), name: NSTableView.columnDidResizeNotification, object: outline)
+        refreshHeaderMenu(outline)
+    }
+
+    private func savedWidth(_ id: String) -> CGFloat? {
+        guard let saved = model.library.session("browser.columnWidths") else { return nil }
+        for part in saved.split(separator: ",") {
+            let bits = part.split(separator: "=")
+            if bits.count == 2, bits[0] == Substring(id), let width = Double(bits[1]) { return CGFloat(width) }
         }
+        return nil
+    }
+
+    @objc private func columnResized(_ notification: Notification) {
+        guard let outline else { return }
+        let encoded = outline.tableColumns.map { "\($0.identifier.rawValue)=\(Int($0.width))" }.joined(separator: ",")
+        model.library.setSession("browser.columnWidths", encoded)
+        if let y = outline.enclosingScrollView?.contentView.bounds.origin.y {
+            model.library.setSession("browser.scroll", "\(y)")
+        }
+    }
 
         private func refreshHeaderMenu(_ outline: NSOutlineView) {
             let menu = NSMenu()
@@ -187,9 +210,22 @@ struct BrowserOutline: NSViewRepresentable {
 
         @objc func open(_ sender: Any?) {
             guard let outline, let row = outline.item(atRow: outline.clickedRow) as? BrowserRow else { return }
-            if opensAsFile(row) {
-                guard let full = model.absolutePath(row.path) else { return }
-                NSWorkspace.shared.open(URL(fileURLWithPath: full))
+            let flags = NSEvent.modifierFlags
+            guard let full = model.absolutePath(row.path) else {
+                model.openPath(row.path, directory: row.isDirectory)
+                return
+            }
+            let url = URL(fileURLWithPath: full)
+            if flags.contains(.command) {
+                if row.isDirectory, !isPackage(row) {
+                    NSWorkspace.shared.open(url)
+                } else {
+                    NSWorkspace.shared.activateFileViewerSelecting([url])
+                }
+                return
+            }
+            if isPackage(row), !flags.contains(.option) {
+                NSWorkspace.shared.open(url)
                 return
             }
             model.openPath(row.path, directory: row.isDirectory)
@@ -202,6 +238,9 @@ struct BrowserOutline: NSViewRepresentable {
             menu.addItem(withTitle: model.t("action.revert"), action: #selector(revert(_:)), keyEquivalent: "")
             menu.addItem(withTitle: model.t("action.compareBase"), action: #selector(compare(_:)), keyEquivalent: "")
             menu.addItem(withTitle: model.t("view.log"), action: #selector(showLog(_:)), keyEquivalent: "")
+            menu.addItem(withTitle: model.t("action.showAll"), action: #selector(showAll(_:)), keyEquivalent: "")
+            menu.addItem(withTitle: model.t("column.depth") + " empty", action: #selector(depthEmpty(_:)), keyEquivalent: "")
+            menu.addItem(withTitle: model.t("column.depth") + " infinity", action: #selector(depthFull(_:)), keyEquivalent: "")
             for item in menu.items { item.target = self }
             return menu
         }
@@ -211,6 +250,14 @@ struct BrowserOutline: NSViewRepresentable {
         @objc func revert(_ sender: Any?) { Task { await model.revert(paths: model.selectedPaths) } }
         @objc func compare(_ sender: Any?) { Task { await model.compareBase() } }
         @objc func showLog(_ sender: Any?) { Task { await model.loadLog() } }
+        @objc func showAll(_ sender: Any?) {
+            model.filter = "all"
+            model.filterLocked = false
+            model.search = ""
+            if let outline { outline.scrollRowToVisible(outline.clickedRow) }
+        }
+        @objc func depthEmpty(_ sender: Any?) { Task { await model.setDepth("empty") } }
+        @objc func depthFull(_ sender: Any?) { Task { await model.setDepth("infinity") } }
 
         func outlineView(_ outlineView: NSOutlineView, pasteboardWriterForItem item: Any) -> NSPasteboardWriting? {
             guard let row = item as? BrowserRow, let full = model.absolutePath(row.path) else { return nil }
@@ -253,10 +300,12 @@ struct BrowserOutline: NSViewRepresentable {
             }
         }
 
-        private func opensAsFile(_ row: BrowserRow) -> Bool {
+        private func isPackage(_ row: BrowserRow) -> Bool {
             let ext = (row.name as NSString).pathExtension.lowercased()
-            return ext == "xcodeproj" || ext == "xcworkspace"
+            return ["xcodeproj", "xcworkspace", "nib", "pages", "app", "bundle", "framework"].contains(ext)
         }
+
+        private func opensAsFile(_ row: BrowserRow) -> Bool { isPackage(row) }
 
         private func fileIcon(_ row: BrowserRow) -> NSImage {
             let image: NSImage

@@ -163,6 +163,7 @@ struct MainWindow: View {
         }
         if model.mode == .timeline { return model.t("view.timeline") }
         if model.mode == .transcript { return model.t("view.transcript") }
+        if model.mode == .commit { return model.t("commit.title") }
         if !model.browserRoot.isEmpty { return (model.browserRoot as NSString).lastPathComponent }
         return windowTitle
     }
@@ -186,7 +187,7 @@ struct MainWindow: View {
                 } actions: {
                     Button(model.t("action.addRepository")) { model.sheet = .addRepository }
                         .buttonStyle(.borderedProminent)
-                    Button(model.t("action.addWorkingCopy")) { model.sheet = .addWorkingCopy }
+                    Button(model.t("action.addWorkingCopy")) { model.pickWorkingCopy() }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if model.rows.isEmpty {
@@ -203,6 +204,8 @@ struct MainWindow: View {
             TimelineView(model: model)
         case .transcript:
             TranscriptView(model: model)
+        case .commit:
+            CommitPane(model: model)
         }
     }
 
@@ -393,8 +396,15 @@ struct FilterBar: View {
                             .onSubmit { Task { await model.refresh() } }
                     }
                     ForEach(filters, id: \.0) { key, title in
-                        let selected = model.filter == key
-                        Button(model.t(title)) { model.filter = key }
+                        let selected = key == "locked" ? (model.filter == "locked" || model.filterLocked) : model.filter == key
+                        Button(model.t(title)) {
+                            if key == "locked", model.filter != "all", model.filter != "locked" {
+                                model.filterLocked.toggle()
+                            } else {
+                                model.filter = key
+                                if key != "locked" { model.filterLocked = false }
+                            }
+                        }
                             .buttonStyle(.plain)
                             .font(.caption.weight(.medium))
                             .lineLimit(1)
@@ -413,6 +423,25 @@ struct FilterBar: View {
         }
         .padding(.horizontal, 10)
         .frame(height: 36)
+        .background {
+            Group {
+                Button("") { model.filter = "all"; model.filterLocked = false }.keyboardShortcut("a", modifiers: .control)
+                Button("") { model.filter = "changed" }.keyboardShortcut("c", modifiers: .control)
+                Button("") { model.filter = "modified" }.keyboardShortcut("o", modifiers: .control)
+                Button("") { model.filter = "conflicted" }.keyboardShortcut("f", modifiers: .control)
+                Button("") { model.filter = "missing" }.keyboardShortcut("g", modifiers: .control)
+                Button("") { model.filter = "unversioned" }.keyboardShortcut("u", modifiers: .control)
+                Button("") { model.filter = "switched" }.keyboardShortcut("s", modifiers: .control)
+                Button("") { model.filter = "locked"; model.filterLocked = false }.keyboardShortcut("l", modifiers: .control)
+                Button("") { model.filter = "newer" }.keyboardShortcut("n", modifiers: .control)
+                Button("") { model.filter = "today" }.keyboardShortcut("t", modifiers: .control)
+                Button("") { model.filter = "week" }.keyboardShortcut("w", modifiers: .control)
+                Button("") { model.filter = "month" }.keyboardShortcut("m", modifiers: .control)
+                Button("") { model.filter = "recent" }.keyboardShortcut("r", modifiers: .control)
+            }
+            .opacity(0)
+            .frame(width: 0, height: 0)
+        }
     }
 
     private var filters: [(String, String)] {
@@ -554,7 +583,7 @@ struct SourceListView: View {
             HStack {
                 Menu {
                     Button(model.t("action.addRepository")) { model.sheet = .addRepository }
-                    Button(model.t("action.addWorkingCopy")) { model.sheet = .addWorkingCopy }
+                    Button(model.t("action.addWorkingCopy")) { model.pickWorkingCopy() }
                 } label: {
                     Image(systemName: "plus")
                         .font(.body.weight(.semibold))

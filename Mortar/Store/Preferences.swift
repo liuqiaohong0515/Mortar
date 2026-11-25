@@ -31,6 +31,11 @@ struct Preferences: Codable, Equatable {
     var enableUserProperties: Bool = true
     var commitLogFontSize: Double = 13
     var autoProps: Bool = false
+    var autoPropsRules: String = ""
+    var savePasswords: Bool = true
+    var clientCertificate: String = ""
+    var proxyUser: String = ""
+    var proxyPassword: String = ""
     var transcriptRetention: String = "month"
     var sshPort: String = ""
     var sshIdentity: String = ""
@@ -42,7 +47,12 @@ struct Preferences: Codable, Equatable {
 
     static func load() -> Preferences {
         guard let data = UserDefaults.standard.data(forKey: defaultsKey),
-              let value = try? JSONDecoder().decode(Preferences.self, from: data) else { return Preferences() }
+              let stored = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let freshData = try? JSONEncoder().encode(Preferences()),
+              var fresh = try? JSONSerialization.jsonObject(with: freshData) as? [String: Any] else { return Preferences() }
+        for (key, value) in stored { fresh[key] = value }
+        guard let merged = try? JSONSerialization.data(withJSONObject: fresh),
+              let value = try? JSONDecoder().decode(Preferences.self, from: merged) else { return Preferences() }
         return value
     }
 

@@ -10,12 +10,11 @@ enum Selection: Hashable {
 }
 
 enum WorkspaceMode: String, CaseIterable {
-    case browser, compare, log, timeline, transcript
+    case browser, compare, log, timeline, transcript, commit
 }
 
 enum WorkspaceSheet: Identifiable {
     case addRepository
-    case addWorkingCopy
     case checkout
     case commit
     case update
@@ -41,7 +40,6 @@ enum WorkspaceSheet: Identifiable {
     var id: String {
         switch self {
         case .addRepository: return "addRepository"
-        case .addWorkingCopy: return "addWorkingCopy"
         case .checkout: return "checkout"
         case .commit: return "commit"
         case .update: return "update"
@@ -107,6 +105,7 @@ struct CompareDocument {
     var rows: [DiffRow]
     var editable: Bool
     var blame: [BlameLine]
+    var propertyOnly: Bool = false
 }
 
 @Observable
@@ -121,6 +120,7 @@ final class AppModel {
     var rows: [BrowserRow] = []
     var browserRoot = ""
     var filter = "all"
+    var filterLocked = false
     var search = ""
     var revisionSpec = "HEAD"
     var showIgnored = false
@@ -146,6 +146,10 @@ final class AppModel {
     var forwardStack: [String] = []
     var pendingTrust = ""
     var activity = ""
+    var operationLeft = ""
+    var operationRight = ""
+    var svnHelpText = ""
+    var lastStdout = ""
 
     init() {
         let store = (try? LibraryStore()) ?? {
@@ -264,22 +268,28 @@ final class AppModel {
             if !hay.contains(query) { return false }
         }
         switch filter {
-        case "changed": return row.letter == "A" || row.letter == "C" || row.letter == "D" || row.letter == "!" || row.letter == "M" || row.letter == "~" || row.letter == "R" || row.letter == "?"
-        case "modified": return row.item == "modified" || row.props == "modified"
-        case "conflicted": return row.item == "conflicted" || row.props == "conflicted"
-        case "missing": return row.item == "missing"
-        case "unversioned": return row.item == "unversioned"
-        case "switched": return row.switched
-        case "locked": return !row.lock.isEmpty
-        case "newer": return !row.reposItem.isEmpty && row.reposItem != "none"
-        case "today": return row.date.map { Calendar.current.isDateInToday($0) } ?? false
-        case "week": return row.date.map { Calendar.current.isDate($0, equalTo: Date(), toGranularity: .weekOfYear) } ?? false
-        case "month": return row.date.map { Calendar.current.isDate($0, equalTo: Date(), toGranularity: .month) } ?? false
+        case "changed": if !isChanged(row) { return false }
+        case "modified": if !(row.item == "modified" || row.props == "modified") { return false }
+        case "conflicted": if !(row.item == "conflicted" || row.props == "conflicted") { return false }
+        case "missing": if row.item != "missing" { return false }
+        case "unversioned": if row.item != "unversioned" { return false }
+        case "switched": if !row.switched { return false }
+        case "locked": if row.lock.isEmpty { return false }
+        case "newer": if row.reposItem.isEmpty || row.reposItem == "none" { return false }
+        case "today": if !(row.date.map { Calendar.current.isDateInToday($0) } ?? false) { return false }
+        case "week": if !(row.date.map { Calendar.current.isDate($0, equalTo: Date(), toGranularity: .weekOfYear) } ?? false) { return false }
+        case "month": if !(row.date.map { Calendar.current.isDate($0, equalTo: Date(), toGranularity: .month) } ?? false) { return false }
         case "recent":
             let newest = rows.compactMap { Int($0.revision) }.max() ?? 0
-            return Int(row.revision) == newest && newest > 0
-        default: return true
+            if !(Int(row.revision) == newest && newest > 0) { return false }
+        default: break
         }
+        if filterLocked, filter != "locked", row.lock.isEmpty { return false }
+        return true
+    }
+
+    private func isChanged(_ row: BrowserRow) -> Bool {
+        ["A", "C", "D", "!", "M", "~", "R", "?"].contains(row.letter)
     }
 
     private var ownerID: String {
@@ -403,10 +413,16 @@ final class AppModel {
     }
 
     @discardableResult
-    func invoke(tool: String = "svn", args: [String], cwd: URL? = nil, repo: RepoRecord? = nil, title: String, reportError: Bool = true) async -> SVNOutput? {
+    func invoke(tool: String = "svn", args: [String], cwd: URL? = nil, repo: RepoRecord? = nil, title: String, reportError: Bool = true, record: Bool = true) async -> SVNOutput? {
         busy = true
         activity = title
-        defer { busy = false; activity = "" }
+        defer {
+            busy = false
+            activity = ""
+            if let delegate = NSApp.delegate as? MortarDelegate, delegate.waitingToQuit {
+                NSApp.reply(toApplicationShouldTerminate: true)
+            }
+        }
         let repository = repo ?? selectedRepository
         let password = repository.flatMap { savedPassword($0) }
         let username = resolvedUsername(repository)
@@ -417,10 +433,29 @@ final class AppModel {
             }
             svnArgs.append(contentsOf: ["--config-option", "config:miscellany:enable-auto-props=\(preferences.autoProps ? "yes" : "no")"])
             svnArgs.append(contentsOf: ["--config-option", "config:miscellany:use-commit-times=\(preferences.useCommitTimes ? "yes" : "no")"])
-            if !preferences.useSharedSVNConfig {
+            if !preferences.httpProxyHost.isEmpty {
+                svnArgs.append(contentsOf: ["--config-option", "servers:global:http-proxy-host=\(preferences.httpProxyHost)"])
+            }
+            if !preferences.httpProxyPort.isEmpty {
+                svnArgs.append(contentsOf: ["--config-option", "servers:global:http-proxy-port=\(preferences.httpProxyPort)"])
+            }
+            if !preferences.proxyUser.isEmpty {
+                svnArgs.append(contentsOf: ["--config-option", "servers:global:http-proxy-username=\(preferences.proxyUser)"])
+            }
+            if !preferences.proxyPassword.isEmpty {
+                svnArgs.append(contentsOf: ["--config-option", "servers:global:http-proxy-password=\(preferences.proxyPassword)"])
+            }
+            if !preferences.clientCertificate.isEmpty {
+                svnArgs.append(contentsOf: ["--config-option", "servers:global:ssl-client-cert-file=\(preferences.clientCertificate)"])
+            }
+            if !preferences.useSharedSVNConfig || !preferences.autoPropsRules.isEmpty {
                 let dir = (try? LibraryStore.supportDirectory())?.appendingPathComponent("svn-config", isDirectory: true)
                 if let dir {
                     try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+                    if !preferences.autoPropsRules.isEmpty {
+                        let config = "[miscellany]\nenable-auto-props = yes\n[auto-props]\n\(preferences.autoPropsRules)\n"
+                        try? config.write(to: dir.appendingPathComponent("config"), atomically: true, encoding: .utf8)
+                    }
                     svnArgs.append(contentsOf: ["--config-dir", dir.path])
                 }
             }
@@ -437,8 +472,19 @@ final class AppModel {
                 trustFailures: repository.map { library.isTrusted($0.url) } ?? false,
                 ssh: ssh
             )
-            library.addTranscript(owner: ownerID.isEmpty ? (repository?.id ?? "app") : ownerID, title: title, body: output.command + "\n" + output.stderr, ok: output.code == 0)
-            transcript = library.transcripts(owner: ownerID)
+            lastStdout = String(data: output.stdout, encoding: .utf8) ?? ""
+            if record {
+                var recorded = output.command + "\n" + output.stderr
+                if args.contains("--dry-run") { recorded += "\n" + lastStdout }
+                if let path = selectedPaths.first, !path.isEmpty { recorded = "#path:\(path)\n" + recorded }
+                if !operationLeft.isEmpty || !operationRight.isEmpty {
+                    recorded = "#range:\(operationLeft)|\(operationRight)\n" + recorded
+                    operationLeft = ""
+                    operationRight = ""
+                }
+                library.addTranscript(owner: ownerID.isEmpty ? (repository?.id ?? "app") : ownerID, title: title, body: recorded, ok: output.code == 0)
+                transcript = library.transcripts(owner: ownerID)
+            }
             if output.code != 0, reportError {
                 if Self.isAuthenticationFailure(output.stderr) {
                     if case .password = sheet {} else { sheet = .password }

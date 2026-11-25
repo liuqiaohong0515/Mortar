@@ -260,6 +260,20 @@ final class LibraryStore {
         bindExec("INSERT OR REPLACE INTO trusted_hosts (host) VALUES (?)", strings: [host])
     }
 
+    func untrust(_ host: String) {
+        exec("DELETE FROM trusted_hosts WHERE host = '\(escape(host))'")
+    }
+
+    func trustedHosts() -> [String] {
+        var statement: OpaquePointer?
+        var rows: [String] = []
+        if sqlite3_prepare_v2(db, "SELECT host FROM trusted_hosts ORDER BY host", -1, &statement, nil) == SQLITE_OK {
+            while sqlite3_step(statement) == SQLITE_ROW { rows.append(text(statement, 0)) }
+        }
+        sqlite3_finalize(statement)
+        return rows
+    }
+
     private func trimTranscripts() {
         let retention = UserDefaults.standard.string(forKey: "transcriptRetention") ?? "month"
         let seconds: TimeInterval

@@ -6,6 +6,10 @@ struct CompareView: View {
     @State private var mode = "side"
     @State private var focus: Int?
     @State private var showLegend = false
+    @State private var findOpen = false
+    @State private var findQuery = ""
+    @State private var selectedSide = ""
+    @FocusState private var findFocused: Bool
 
     var body: some View {
         VStack(spacing: 0) {
@@ -25,15 +29,35 @@ struct CompareView: View {
                     revisionMenu(document.rightTitle, left: false)
                     Button(model.t("compare.previous")) { step(-1) }
                     Button(model.t("compare.next")) { step(1) }
+                    Button(model.t("compare.find")) { findOpen = true; findFocused = true }
                     Button(model.t("action.showAnnotations")) { showLegend.toggle() }
                         .disabled((model.compare?.blame ?? []).isEmpty)
                 }
                 .padding(6)
+                if findOpen {
+                    HStack {
+                        TextField(model.t("compare.find"), text: $findQuery)
+                            .textFieldStyle(.roundedBorder)
+                            .focused($findFocused)
+                        Button(model.t("compare.previous")) { stepMatch(-1) }
+                        Button(model.t("compare.next")) { stepMatch(1) }
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.bottom, 4)
+                }
+                if document.propertyOnly {
+                    Text(model.t("compare.properties")).font(.caption).foregroundStyle(.secondary)
+                }
                 if showLegend { legend }
                 if let left = document.leftImage, let right = document.rightImage, let a = NSImage(data: left), let b = NSImage(data: right) {
                     ImageCompare(left: a, right: b, mode: mode)
                 } else if document.leftText.utf8.contains(0) || document.rightText.utf8.contains(0) {
-                    ContentUnavailableView(model.t("compare.binary"), systemImage: "doc")
+                    VStack {
+                        ContentUnavailableView(model.t("compare.binary"), systemImage: "doc")
+                        Text("\(document.leftText.utf8.count) / \(document.rightText.utf8.count)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                 } else {
                     SideBySideDiff(
                         rows: document.rows,
@@ -44,14 +68,50 @@ struct CompareView: View {
                         blame: model.preferences.showAnnotations ? document.blame : [],
                         editable: document.editable,
                         focus: focus,
-                        onApply: { model.discardHunk(at: $0) },
-                        onDiscard: { model.discardHunk(at: $0) }
+                        fontSize: CGFloat(model.preferences.fontSize),
+                        tabWidth: model.preferences.tabWidth,
+                        fontName: model.preferences.fontName,
+                        query: findQuery,
+                        selectedSide: selectedSide,
+                        onApply: { model.applyHunk(at: $0) },
+                        onDiscard: { model.discardHunk(at: $0) },
+                        onEdit: { model.replaceWorkingLine($0, $1) }
                     )
                 }
             } else {
                 ContentUnavailableView(model.t("empty.selectFile"), systemImage: "doc.text.magnifyingglass")
             }
         }
+        .background {
+            Group {
+                Button("") { findOpen = true; findFocused = true }.keyboardShortcut("f", modifiers: .command)
+                Button("") { selectSide("left") }.keyboardShortcut("a", modifiers: .command)
+                Button("") { selectSide("right") }.keyboardShortcut("a", modifiers: [.command, .option])
+                Button("") { stepMatch(1) }.keyboardShortcut("g", modifiers: .command)
+                Button("") { stepMatch(-1) }.keyboardShortcut("g", modifiers: [.command, .shift])
+            }
+            .opacity(0)
+            .frame(width: 0, height: 0)
+        }
+    }
+
+    private func selectSide(_ side: String) {
+        selectedSide = side
+        let text = side == "left" ? model.compare?.leftText : model.compare?.rightText
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text ?? "", forType: .string)
+    }
+
+    private func stepMatch(_ direction: Int) {
+        let query = findQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return }
+        let hits = (model.compare?.rows ?? []).filter {
+            $0.left.localizedCaseInsensitiveContains(query) || $0.right.localizedCaseInsensitiveContains(query)
+        }.map(\.id)
+        guard !hits.isEmpty else { return }
+        let current = hits.firstIndex(of: focus ?? -1) ?? (direction > 0 ? -1 : 0)
+        let next = (current + direction + hits.count) % hits.count
+        focus = hits[next]
     }
 
     private var legend: some View {
@@ -96,39 +156,64 @@ struct SideBySideDiff: View {
     var blame: [BlameLine] = []
     var editable = false
     var focus: Int?
+    var fontSize: CGFloat = 12
+    var tabWidth: Int = 4
+    var fontName: String = "Menlo"
+    var query: String = ""
+    var selectedSide: String = ""
     var onApply: (Int) -> Void = { _ in }
     var onDiscard: (Int) -> Void = { _ in }
+    var onEdit: (Int, String) -> Void = { _, _ in }
+    @State private var editing: Int?
+    @State private var draft = ""
 
     var body: some View {
         ScrollViewReader { proxy in
-            ScrollView([.vertical, .horizontal]) {
-                LazyVStack(alignment: .leading, spacing: 0) {
-                    ForEach(rows) { row in
-                        HStack(alignment: .top, spacing: 0) {
-                            line(display(row.left), number: row.leftNumber, kind: leftKind(row), other: row.right, blameLine: nil)
-                            Rectangle().fill(Color(nsColor: .separatorColor)).frame(width: 1)
-                            line(display(row.right), number: row.rightNumber, kind: rightKind(row), other: row.left, blameLine: blame.first { $0.line == row.rightNumber })
-                            if editable, row.kind != .same {
-                                VStack(spacing: 2) {
-                                    Button("←") { if let hunk = hunkIndex(row) { onApply(hunk) } }
-                                    Button("×") { if let hunk = hunkIndex(row) { onDiscard(hunk) } }
+            HStack(spacing: 0) {
+                ScrollView([.vertical, .horizontal]) {
+                    LazyVStack(alignment: .leading, spacing: 0) {
+                        ForEach(rows) { row in
+                            HStack(alignment: .top, spacing: 0) {
+                                line(display(row.left), number: row.leftNumber, kind: leftKind(row), other: row.right, blameLine: nil, side: "left", rowID: row.id)
+                                Rectangle().fill(Color(nsColor: .separatorColor)).frame(width: 1)
+                                line(display(row.right), number: row.rightNumber, kind: rightKind(row), other: row.left, blameLine: blame.first { $0.line == row.rightNumber }, side: "right", rowID: row.id)
+                                if editable, row.kind != .same {
+                                    VStack(spacing: 2) {
+                                        Button("←") { if let hunk = hunkIndex(row) { onApply(hunk) } }
+                                        Button("×") { if let hunk = hunkIndex(row) { onDiscard(hunk) } }
+                                    }
+                                    .font(.caption2)
+                                    .buttonStyle(.borderless)
                                 }
-                                .font(.caption2)
-                                .buttonStyle(.borderless)
                             }
-                            if row.kind != .same {
-                                Rectangle().fill(Color.green.opacity(0.85)).frame(width: 3)
-                            } else {
-                                Color.clear.frame(width: 3)
-                            }
+                            .id(row.id)
                         }
-                        .id(row.id)
                     }
                 }
+                markerRail(proxy)
             }
             .onAppear { scroll(proxy, to: focus ?? rows.first { $0.kind != .same }?.id) }
             .onChange(of: focus) { _, value in scroll(proxy, to: value) }
         }
+    }
+
+    private func markerRail(_ proxy: ScrollViewProxy) -> some View {
+        GeometryReader { geo in
+            let changed = rows.filter { $0.kind != .same }
+            let total = max(rows.count, 1)
+            ForEach(changed) { row in
+                let color: Color = row.kind == .delete ? .red : (row.kind == .insert ? .green : .orange)
+                Button {
+                    proxy.scrollTo(row.id, anchor: .center)
+                } label: {
+                    RoundedRectangle(cornerRadius: 1).fill(color).frame(width: 8, height: 4)
+                }
+                .buttonStyle(.plain)
+                .position(x: 6, y: max(4, geo.size.height * (CGFloat(row.id) + 0.5) / CGFloat(total)))
+            }
+        }
+        .frame(width: 12)
+        .background(Color(nsColor: .separatorColor).opacity(0.15))
     }
 
     private func scroll(_ proxy: ScrollViewProxy, to id: Int?) {
@@ -155,16 +240,19 @@ struct SideBySideDiff: View {
         }
     }
 
+    private var modelFont: CGFloat { fontSize }
+
     private func display(_ text: String) -> String {
-        guard showInvisibles else { return text }
-        return text.replacingOccurrences(of: " ", with: "·").replacingOccurrences(of: "\t", with: "→")
+        let expanded = text.replacingOccurrences(of: "\t", with: String(repeating: " ", count: max(1, tabWidth)))
+        guard showInvisibles else { return expanded }
+        return expanded.replacingOccurrences(of: " ", with: "·")
     }
 
-    private func line(_ text: String, number: Int?, kind: DiffRow.Kind, other: String, blameLine: BlameLine?) -> some View {
+    private func line(_ text: String, number: Int?, kind: DiffRow.Kind, other: String, blameLine: BlameLine?, side: String, rowID: Int) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
             if showNumbers {
                 Text(number.map(String.init) ?? "")
-                    .font(.system(size: 11, design: .monospaced))
+                    .font(.custom(fontName, size: 11))
                     .foregroundStyle(.tertiary)
                     .frame(width: 36, alignment: .trailing)
             }
@@ -175,15 +263,30 @@ struct SideBySideDiff: View {
                     .frame(width: 72, alignment: .leading)
                     .lineLimit(1)
             }
-            Text(highlighted(text, other: showInline && kind == .change ? other : nil))
-                .font(.system(size: 12, design: .monospaced))
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .textSelection(.enabled)
+            if side == "right", editable, editing == rowID {
+                TextField("", text: $draft)
+                    .font(.custom(fontName, size: modelFont))
+                    .onSubmit {
+                        if let number { onEdit(number, draft) }
+                        editing = nil
+                    }
+            } else {
+                Text(highlighted(text, other: showInline && kind == .change ? other : nil))
+                    .font(.custom(fontName, size: modelFont))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .textSelection(.enabled)
+                    .onTapGesture(count: 2) {
+                        guard side == "right", editable, number != nil else { return }
+                        draft = text
+                        editing = rowID
+                    }
+            }
         }
         .padding(.vertical, 1)
         .padding(.trailing, 8)
         .frame(minWidth: 420, alignment: .leading)
         .background(background(kind))
+        .overlay(selectedSide == side ? Color.accentColor.opacity(0.12) : Color.clear)
     }
 
     private func background(_ kind: DiffRow.Kind) -> Color {
@@ -207,6 +310,16 @@ struct SideBySideDiff: View {
                 if before && after, let lower = AttributedString.Index(range.lowerBound, within: text), let upper = AttributedString.Index(range.upperBound, within: text) {
                     text[lower..<upper].foregroundColor = .purple
                 }
+                search = range.upperBound
+            }
+        }
+        if !query.isEmpty {
+            var search = source.startIndex
+            while let range = source.range(of: query, options: .caseInsensitive, range: search..<source.endIndex) {
+                if let lower = AttributedString.Index(range.lowerBound, within: text), let upper = AttributedString.Index(range.upperBound, within: text), lower < upper {
+                    text[lower..<upper].backgroundColor = Color.orange.opacity(0.55)
+                }
+                if range.upperBound == source.endIndex { break }
                 search = range.upperBound
             }
         }
@@ -306,10 +419,28 @@ struct ImageCompare: View {
     var left: NSImage
     var right: NSImage
     var mode: String
+    @State private var fit = true
+    @State private var magnification: CGFloat = 1
     @State private var split = 0.5
 
     var body: some View {
-        GeometryReader { proxy in
+        VStack {
+            HStack {
+                Button(modelFit) { fit.toggle() }
+                Button("−") { magnification = max(0.25, magnification - 0.25) }
+                Button("+") { magnification = min(4, magnification + 0.25) }
+            }
+            .buttonStyle(.borderless)
+            GeometryReader { proxy in
+                imageBody(proxy)
+                    .scaleEffect(fit ? 1 : magnification)
+            }
+        }
+    }
+
+    private var modelFit: String { fit ? "1:1" : "Fit" }
+
+    @ViewBuilder private func imageBody(_ proxy: GeometryProxy) -> some View {
             ZStack {
                 if mode == "pixels" {
                     Image(nsImage: difference())
@@ -329,7 +460,6 @@ struct ImageCompare: View {
                     }
                 }
             }
-        }
     }
 
     private func difference() -> NSImage {
@@ -395,6 +525,22 @@ struct LogView: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
+        .background {
+            Group {
+                Button("") { logFilter = "all" }.keyboardShortcut("a", modifiers: .control)
+                Button("") { logFilter = "mine" }.keyboardShortcut("y", modifiers: .control)
+                Button("") { logFilter = "others" }.keyboardShortcut("p", modifiers: .control)
+                Button("") { logFilter = "newer" }.keyboardShortcut("n", modifiers: .control)
+                Button("") { logFilter = "today" }.keyboardShortcut("t", modifiers: .control)
+                Button("") { logFilter = "week" }.keyboardShortcut("w", modifiers: .control)
+                Button("") { logFilter = "month" }.keyboardShortcut("m", modifiers: .control)
+                Button("") { logFilter = "added" }.keyboardShortcut("e", modifiers: .control)
+                Button("") { logFilter = "deleted" }.keyboardShortcut("d", modifiers: .control)
+                Button("") { logFilter = "replaced" }.keyboardShortcut("r", modifiers: .control)
+            }
+            .opacity(0)
+            .frame(width: 0, height: 0)
+        }
     }
 
     private var filters: [(String, String)] {
@@ -431,12 +577,17 @@ struct LogView: View {
                         .background(.quaternary, in: Capsule())
                 }
                 Spacer()
+                if workingRevision > 0 {
+                    Button(model.t("action.update")) { Task { await model.updateToRevision(entry.revision) } }
+                        .buttonStyle(.borderless)
+                }
                 if workingRevision > 0, entry.revision < workingRevision {
                     Button(model.t("log.revertTo")) { Task { await model.revertToRevision(entry.revision) } }
                         .buttonStyle(.borderless)
                 }
                 Button(model.t("action.copyURL")) { copyLog(entry) }
                     .buttonStyle(.borderless)
+                ShareLink(item: "r\(entry.revision) \(entry.author)\n\(entry.message)")
                 Text(meta(entry))
                     .font(.callout)
                     .foregroundStyle(.secondary)
@@ -601,8 +752,16 @@ struct TimelineView: View {
     @Bindable var model: AppModel
     @State private var filter = "all"
     @State private var query = ""
+    @State private var author = ""
+    @State private var revisionFrom = ""
+    @State private var revisionTo = ""
+    @State private var useDates = false
+    @State private var dateFrom = Calendar.current.date(byAdding: .month, value: -1, to: Date()) ?? Date()
+    @State private var dateTo = Date()
     @State private var picks: [Int] = []
     @State private var compared: [Int] = []
+    @State private var ancestors: [LogEntry] = []
+    @State private var ancestorTitle = ""
 
     private let slot: CGFloat = 76
 
@@ -614,7 +773,16 @@ struct TimelineView: View {
                 ContentUnavailableView(model.t("empty.selectFile"), systemImage: "timeline.selection")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                track
+                if !ancestors.isEmpty {
+                    ancestorTrack
+                }
+                if model.selectedPaths.count > 1 {
+                    ForEach(model.selectedPaths, id: \.self) { path in
+                        axis(path)
+                    }
+                } else {
+                    track
+                }
                 Divider()
                 if showsCompare {
                     CompareView(model: model)
@@ -642,7 +810,13 @@ struct TimelineView: View {
         } else {
             source = logsFiltered(model.logs, filter: filter, username: "", query: query)
         }
-        return source.sorted { $0.revision < $1.revision }
+        return source.filter { entry in
+            if !author.isEmpty, !entry.author.localizedCaseInsensitiveContains(author) { return false }
+            if let from = Int(revisionFrom), entry.revision < from { return false }
+            if let to = Int(revisionTo), entry.revision > to { return false }
+            if useDates, let date = entry.date, date < dateFrom || date > dateTo { return false }
+            return true
+        }.sorted { $0.revision < $1.revision }
     }
 
     private var targetName: String {
@@ -662,12 +836,80 @@ struct TimelineView: View {
                     .foregroundStyle(filter == key ? Color.accentColor : Color.secondary)
             }
             Spacer()
+            TextField(model.t("timeline.author"), text: $author)
+                .textFieldStyle(.roundedBorder)
+                .frame(width: 100)
+            TextField(model.t("field.revision"), text: $revisionFrom)
+                .textFieldStyle(.roundedBorder)
+                .frame(width: 64)
+            TextField(model.t("field.revision"), text: $revisionTo)
+                .textFieldStyle(.roundedBorder)
+                .frame(width: 64)
+            Toggle(model.t("column.date"), isOn: $useDates)
+                .toggleStyle(.checkbox)
+            if useDates {
+                DatePicker("", selection: $dateFrom, displayedComponents: .date).labelsHidden()
+                DatePicker("", selection: $dateTo, displayedComponents: .date).labelsHidden()
+            }
             TextField(model.t("filter.search"), text: $query)
                 .textFieldStyle(.roundedBorder)
-                .frame(width: 180)
+                .frame(width: 140)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
+    }
+
+    private func axis(_ path: String) -> some View {
+        HStack {
+            Text((path as NSString).lastPathComponent)
+                .frame(width: 160, alignment: .leading)
+                .lineLimit(1)
+            ScrollView(.horizontal, showsIndicators: false) {
+                ZStack {
+                    Capsule().fill(Color.secondary.opacity(0.35)).frame(height: 2)
+                    HStack(spacing: 8) {
+                        ForEach(entries.filter { $0.changes.contains { $0.path.hasSuffix(path) || path.hasSuffix($0.path) } }) { entry in
+                            nodeButton(entry, path: path)
+                        }
+                    }
+                }
+            }
+        }
+        .padding(.horizontal, 8)
+    }
+
+    private var ancestorTrack: some View {
+        HStack {
+            Text(ancestorTitle).lineLimit(1).frame(width: 160, alignment: .leading)
+            ScrollView(.horizontal, showsIndicators: false) {
+                ZStack {
+                    Capsule().fill(Color.purple.opacity(0.45)).frame(height: 2)
+                    HStack(spacing: 8) {
+                        ForEach(ancestors) { entry in
+                            nodeButton(entry, path: "")
+                        }
+                    }
+                }
+            }
+        }
+        .padding(.horizontal, 8)
+    }
+
+    private func nodeButton(_ entry: LogEntry, path: String) -> some View {
+        let mark = symbol(for: entry, path: path)
+        return Button { pick(entry.revision, path: path.isEmpty ? (model.selectedPaths.first ?? "") : path) } label: {
+            Image(systemName: mark.0).foregroundStyle(mark.1)
+        }
+        .buttonStyle(.plain)
+        .help("r\(entry.revision)  \(entry.author)")
+        .contextMenu {
+            if let change = entry.changes.first(where: { !$0.copyFromPath.isEmpty }) {
+                Button(model.t("timeline.ancestor")) {
+                    ancestorTitle = (change.copyFromPath as NSString).lastPathComponent
+                    Task { ancestors = await model.ancestorLog(change) }
+                }
+            }
+        }
     }
 
     private var track: some View {
@@ -727,6 +969,14 @@ struct TimelineView: View {
                     .buttonStyle(.plain)
                     .frame(width: slot)
                     .help("r\(entry.revision)  \(entry.author)\n\(entry.message)")
+                    .contextMenu {
+                        if let change = entry.changes.first(where: { !$0.copyFromPath.isEmpty }) {
+                            Button(model.t("timeline.ancestor")) {
+                                ancestorTitle = (change.copyFromPath as NSString).lastPathComponent
+                                Task { ancestors = await model.ancestorLog(change) }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -745,8 +995,7 @@ struct TimelineView: View {
         .frame(height: 16)
     }
 
-    private func symbol(for entry: LogEntry) -> (String, Color) {
-        let path = model.selectedPaths.first ?? ""
+    private func symbol(for entry: LogEntry, path: String) -> (String, Color) {
         let change = entry.changes.first { path.isEmpty || $0.path.hasSuffix(path) || path.hasSuffix($0.path) }
         if let change, !change.copyFromPath.isEmpty { return ("arrow.triangle.branch", .purple) }
         switch change?.action {
@@ -756,6 +1005,15 @@ struct TimelineView: View {
         case "M": return ("circle.fill", .blue)
         default: return ("circle", .secondary)
         }
+    }
+
+    private func symbol(for entry: LogEntry) -> (String, Color) {
+        symbol(for: entry, path: model.selectedPaths.first ?? "")
+    }
+
+    private func pick(_ revision: Int, path: String) {
+        model.selectedPaths = [path]
+        pick(revision)
     }
 
     private func pick(_ revision: Int) {
@@ -856,14 +1114,28 @@ struct TranscriptView: View {
             .contextMenu {
                 Button(model.t("transcript.note")) { model.sheet = .note(entry.id) }
                 Button(model.t("action.showDifferences")) { showTranscriptDiff(entry) }
+                Button(model.t("action.showInWorkingCopy")) { showInWorkingCopy(entry) }
             }
         }
     }
 
     private func showTranscriptDiff(_ entry: TranscriptRecord) {
+        let lines = entry.body.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        if let range = lines.first(where: { $0.hasPrefix("#range:") })?.dropFirst("#range:".count).split(separator: "|", maxSplits: 1).map(String.init), range.count == 2, !range[0].isEmpty, !range[1].isEmpty {
+            let path = lines.first { $0.hasPrefix("#path:") }.map { String($0.dropFirst("#path:".count)) } ?? model.selectedPaths.first
+            Task { await model.compare(path: path, left: range[0], right: range[1], switchMode: true) }
+            return
+        }
         let numbers = entry.body.split { !$0.isNumber }.compactMap { Int($0) }
         guard numbers.count >= 2 else { return }
         Task { await model.compare(path: model.selectedPaths.first, left: "\(numbers[0])", right: "\(numbers[1])", switchMode: true) }
+    }
+
+    private func showInWorkingCopy(_ entry: TranscriptRecord) {
+        if let path = entry.body.split(separator: "\n").first(where: { $0.hasPrefix("#path:") }).map({ String($0.dropFirst("#path:".count)) }), !path.isEmpty {
+            model.selectedPaths = [path]
+        }
+        model.mode = .browser
     }
 
     private func coloredTranscript(_ body: String) -> AttributedString {
@@ -880,6 +1152,20 @@ struct TranscriptView: View {
             cursor = end < body.endIndex ? body.index(after: end) : body.endIndex
         }
         return text
+    }
+}
+
+private struct UserPropertyText: View {
+    var title: String
+    var value: String
+    var onCommit: (String) -> Void
+    @State private var draft = ""
+
+    var body: some View {
+        TextField(title, text: $draft)
+            .onAppear { draft = value }
+            .onChange(of: value) { _, newValue in draft = newValue }
+            .onSubmit { onCommit(draft) }
     }
 }
 
@@ -919,12 +1205,31 @@ struct InspectorView: View {
                                 Spacer()
                                 Button(model.t("action.delete")) { Task { await model.deleteProperty(property.name) } }
                                     .buttonStyle(.borderless)
+                                Button(model.t("action.revert")) { Task { await model.revertPropertyToBase(property.name) } }
+                                    .buttonStyle(.borderless)
                             }
                         }
                         if model.preferences.enableUserProperties {
                             ForEach(model.library.userProperties().filter(\.enabled)) { item in
-                                Text(item.label.isEmpty ? item.name : item.label).font(.caption)
-                                Text(model.properties.first { $0.name == item.name }?.value ?? "").font(.callout)
+                                let value = model.properties.first { $0.name == item.name }?.value ?? ""
+                                switch item.type {
+                                case "checkbox":
+                                    Toggle(item.label.isEmpty ? item.name : item.label, isOn: Binding(get: { value == "1" || value == "yes" }, set: { on in
+                                        Task { await model.setProperty(item.name, on ? "1" : "0") }
+                                    }))
+                                case "popup":
+                                    Picker(item.label.isEmpty ? item.name : item.label, selection: Binding(get: { value }, set: { newValue in
+                                        Task { await model.setProperty(item.name, newValue) }
+                                    })) {
+                                        ForEach(item.options.split(separator: ",").map(String.init), id: \.self) { option in
+                                            Text(option).tag(option)
+                                        }
+                                    }
+                                default:
+                                    UserPropertyText(title: item.label.isEmpty ? item.name : item.label, value: value) { newValue in
+                                        Task { await model.setProperty(item.name, newValue) }
+                                    }
+                                }
                             }
                         }
                         TextField(model.t("field.name"), text: $propName)
@@ -939,6 +1244,7 @@ struct InspectorView: View {
                         Button(model.t("action.unlock")) { Task { await model.unlockSelected(force: false) } }
                     }
                     Button(model.t("pref.doubleClick.open")) { model.openEditor() }
+                    Button(model.t("inspector.openWith")) { model.rememberDefaultApp() }
                 }
             }
             .padding(12)
@@ -961,5 +1267,80 @@ struct InspectorView: View {
             Text(value).textSelection(.enabled)
         }
         .font(.callout)
+    }
+}
+
+struct CommitPane: View {
+    @Bindable var model: AppModel
+    @State private var message = ""
+    @State private var unlock = true
+    @State private var postScript = ""
+    @State private var expanded: String?
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 0) {
+            VStack(alignment: .leading, spacing: 8) {
+                Text(model.t("commit.title")).font(.title3)
+                TextEditor(text: $message)
+                    .font(.system(size: model.preferences.commitLogFontSize, design: .monospaced))
+                    .frame(minHeight: 180)
+                if !model.logs.isEmpty {
+                    Menu(model.t("log.copy")) {
+                        ForEach(model.logs.prefix(6)) { entry in
+                            Button(entry.message.isEmpty ? "r\(entry.revision)" : entry.message) { message = entry.message }
+                        }
+                    }
+                }
+                TextField(model.t("commit.postScript"), text: $postScript)
+                Toggle(model.t("commit.unlock"), isOn: $unlock)
+                HStack {
+                    Button(model.t("action.cancel")) { cancel() }
+                        .keyboardShortcut(.cancelAction)
+                    Spacer()
+                    Button(model.t("commit.button")) {
+                        Task { await model.commit(message: message, unlock: unlock, preScript: model.preferences.preCommitScript, postScript: postScript) }
+                    }
+                    .keyboardShortcut(.defaultAction)
+                }
+            }
+            .padding(16)
+            .frame(minWidth: 280, maxWidth: 420)
+            Divider()
+            List {
+                ForEach(model.commitItems) { item in
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack {
+                            Toggle(isOn: Binding(get: { item.included }, set: { _ in
+                                model.toggleCommit(item.path, option: NSEvent.modifierFlags.contains(.option))
+                            })) {
+                                Text("\(item.letter)  \(item.path)").font(.system(.body, design: .monospaced))
+                            }
+                            if !(model.rows.first { $0.path == item.path }?.isDirectory ?? true) {
+                                Button(expanded == item.path ? "▾" : "▸") {
+                                    expanded = expanded == item.path ? nil : item.path
+                                    if expanded == item.path {
+                                        Task { await model.compare(path: item.path, left: "BASE", right: "WORKING", switchMode: false) }
+                                    }
+                                }
+                                .buttonStyle(.borderless)
+                            }
+                        }
+                        if expanded == item.path, model.compare?.path == item.path {
+                            Text(model.compare?.rows.filter { $0.kind != .same }.prefix(8).map { $0.kind == .delete ? "- \($0.left)" : "+ \($0.right)" }.joined(separator: "\n") ?? "")
+                                .font(.system(size: 11, design: .monospaced))
+                                .lineLimit(8)
+                        }
+                    }
+                }
+            }
+        }
+        .onAppear { message = model.logDraft }
+        .onChange(of: message) { _, value in model.logDraft = value }
+        .onExitCommand { cancel() }
+    }
+
+    private func cancel() {
+        model.logDraft = message
+        model.mode = .browser
     }
 }

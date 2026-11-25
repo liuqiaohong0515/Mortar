@@ -56,6 +56,7 @@ struct PreferencesView: View {
         Form {
             TextField(model.t("pref.globalIgnores"), text: $prefs.globalIgnores, axis: .vertical)
             Toggle(model.t("pref.autoProps"), isOn: $prefs.autoProps)
+            TextField(model.t("pref.autoProps"), text: $prefs.autoPropsRules, axis: .vertical)
             Toggle(model.t("pref.useCommitTimes"), isOn: $prefs.useCommitTimes)
             Toggle(model.t("pref.showTranscriptOnUpdate"), isOn: $prefs.showTranscriptOnUpdate)
             Toggle(model.t("pref.allowExternalHEAD"), isOn: $prefs.allowExternalHEAD)
@@ -79,6 +80,18 @@ struct PreferencesView: View {
             TextField(model.t("pref.sshSendEnv"), text: $prefs.sshSendEnv, axis: .vertical)
             TextField(model.t("field.url"), text: $prefs.httpProxyHost)
             TextField(model.t("pref.proxyPort"), text: $prefs.httpProxyPort)
+            TextField(model.t("field.username"), text: $prefs.proxyUser)
+            SecureField(model.t("field.password"), text: $prefs.proxyPassword)
+            TextField(model.t("field.url"), text: $prefs.clientCertificate)
+            Toggle(model.t("password.explain"), isOn: $prefs.savePasswords)
+            if let repo = model.selectedRepository {
+                ForEach(model.library.trustedHosts(), id: \.self) { host in
+                    HStack {
+                        Text(host).lineLimit(1)
+                        Button(model.t("action.delete")) { model.library.untrust(host) }
+                    }
+                }
+            }
         }
     }
 

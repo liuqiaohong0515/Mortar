@@ -1,7 +1,19 @@
 import AppKit
 import Foundation
+import UniformTypeIdentifiers
 
 extension AppModel {
+    func pickWorkingCopy() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.prompt = t("action.addWorkingCopy")
+        if panel.runModal() == .OK, let url = panel.url {
+            Task { await addWorkingCopy(at: url) }
+        }
+    }
+
     func addWorkingCopy(at url: URL, forceNetwork: Bool = false) async {
         if !forceNetwork, let values = try? url.resourceValues(forKeys: [.volumeIsLocalKey]), values.volumeIsLocal == false {
             sheet = .networkVolume(url.path)
@@ -132,10 +144,32 @@ extension AppModel {
         if !revision.isEmpty, revision != "HEAD" { args.append(contentsOf: ["-r", revision]) }
         if let depth { args.append(contentsOf: ["--set-depth", depth]) }
         if !externals { args.append("--ignore-externals") }
+        operationLeft = info.revision
+        operationRight = revision
         _ = await invoke(args: args, cwd: URL(fileURLWithPath: wc.path), repo: repository(for: wc), title: t("action.update"))
         notify("update", title: wc.name)
         if preferences.showTranscriptOnUpdate { mode = .transcript }
         await refresh()
+    }
+
+    func setDepth(_ depth: String) async {
+        guard let wc = selectedWorkingCopy else { return }
+        let targets = targetPaths(wc)
+        _ = await invoke(args: ["update", "--set-depth", depth] + targets, cwd: URL(fileURLWithPath: wc.path), repo: repository(for: wc), title: t("column.depth"))
+        await refresh()
+    }
+
+    func toggleCommit(_ path: String, option: Bool) {
+        guard let index = commitItems.firstIndex(where: { $0.path == path }) else { return }
+        let turnOn = !commitItems[index].included
+        let pair = commitItems[index].pairedPath
+        let isDirectory = rows.first { $0.path == path }?.isDirectory == true
+        for i in commitItems.indices {
+            let item = commitItems[i]
+            let paired = item.path == path || (!pair.isEmpty && (item.path == pair || item.pairedPath == path))
+            let child = option && isDirectory && item.path.hasPrefix(path + "/")
+            if paired || child { commitItems[i].included = turnOn }
+        }
     }
 
     func prepareCommit() {
@@ -147,7 +181,7 @@ extension AppModel {
         }
         if items.isEmpty { items = changed.map { CommitItem(path: $0.path, letter: $0.letter, included: true, pairedPath: pair(for: $0)) } }
         commitItems = items
-        sheet = .commit
+        mode = .commit
     }
 
     func commit(message: String, unlock: Bool, preScript: String, postScript: String) async {
@@ -182,6 +216,7 @@ extension AppModel {
             logDraft = message
         }
         sheet = nil
+        if mode == .commit { mode = .browser }
         await refresh()
     }
 
@@ -329,13 +364,32 @@ extension AppModel {
         }
         let leftText = await cat(full, revision: left, wc: wc)
         let rightText = right == "WORKING" ? (try? String(contentsOfFile: full, encoding: .utf8)) ?? "" : await cat(full, revision: right, wc: wc)
+        var rows = TextDiff.rows(left: leftText, right: rightText, options: diffOptions())
+        var shownLeft = leftText
+        var shownRight = rightText
+        var propertyOnly = false
+        if rows.allSatisfy({ $0.kind == .same }) {
+            let leftProps = await propertyText(full: full, revision: left, wc: wc)
+            let rightProps = await propertyText(full: full, revision: right, wc: wc)
+            if leftProps != rightProps {
+                shownLeft = leftProps
+                shownRight = rightProps
+                rows = TextDiff.rows(left: leftProps, right: rightProps, options: diffOptions())
+                propertyOnly = true
+            }
+        }
         compare = CompareDocument(
-            path: relative, leftTitle: left, rightTitle: right, leftText: leftText, rightText: rightText,
-            leftImage: nil, rightImage: nil, rows: TextDiff.rows(left: leftText, right: rightText, options: diffOptions()),
-            editable: right == "WORKING", blame: []
+            path: relative, leftTitle: left, rightTitle: right, leftText: shownLeft, rightText: shownRight,
+            leftImage: nil, rightImage: nil, rows: rows,
+            editable: right == "WORKING" && !propertyOnly, blame: [], propertyOnly: propertyOnly
         )
         if switchMode { mode = .compare }
         if preferences.showAnnotations { await loadBlame(full: full, wc: wc) }
+    }
+
+    func loadSVNHelp() async {
+        guard let output = await invoke(args: ["help"], title: t("menu.svnHelp"), reportError: false) else { return }
+        svnHelpText = String(data: output.stdout, encoding: .utf8) ?? output.stderr
     }
 
     func diffOptions() -> TextDiff.Options {
@@ -343,26 +397,10 @@ extension AppModel {
     }
 
     func setCompareRevision(left: Bool, revision: String) async {
-        guard var document = compare, let full = absolutePath(document.path) else { return }
-        let wc = selectedWorkingCopy
-        let text: String
-        if revision == "WORKING" {
-            text = (try? String(contentsOfFile: full, encoding: .utf8)) ?? ""
-        } else if let wc {
-            text = await cat(full, revision: revision, wc: wc)
-        } else {
-            return
-        }
-        if left {
-            document.leftText = text
-            document.leftTitle = revision
-        } else {
-            document.rightText = text
-            document.rightTitle = revision
-            document.editable = revision == "WORKING"
-        }
-        document.rows = TextDiff.rows(left: document.leftText, right: document.rightText, options: diffOptions())
-        compare = document
+        guard let document = compare else { return }
+        let newLeft = left ? revision : document.leftTitle
+        let newRight = left ? document.rightTitle : revision
+        await compare(path: document.path, left: newLeft, right: newRight, switchMode: false)
     }
 
     func compareExternal() {
@@ -382,6 +420,22 @@ extension AppModel {
         compare?.blame = SVNXML.blame(output.stdout)
     }
 
+    func applyHunk(at index: Int) {
+        guard var document = compare, document.editable else { return }
+        let hunks = TextDiff.hunks(document.rows)
+        guard hunks.indices.contains(index) else { return }
+        var rightLines = document.rightText.components(separatedBy: "\n")
+        for row in document.rows[hunks[index]].reversed() {
+            if row.kind == .delete {
+                let at = min((row.leftNumber ?? rightLines.count + 1) - 1, rightLines.count)
+                rightLines.insert(row.left, at: max(0, at))
+            } else if let number = row.rightNumber, number - 1 < rightLines.count, row.kind == .change {
+                rightLines[number - 1] = row.left
+            }
+        }
+        finishHunk(&document, rightLines)
+    }
+
     func discardHunk(at index: Int) {
         guard var document = compare, document.editable else { return }
         let hunks = TextDiff.hunks(document.rows)
@@ -390,20 +444,33 @@ extension AppModel {
         var rightLines = document.rightText.components(separatedBy: "\n")
         let slice = document.rows[range]
         for row in slice.reversed() {
-            if let number = row.rightNumber, number - 1 < rightLines.count, row.kind != .same {
+            if let number = row.rightNumber, number - 1 < rightLines.count, row.kind == .insert || row.kind == .change {
                 if row.kind == .insert {
                     rightLines.remove(at: number - 1)
-                } else if row.kind == .delete || row.kind == .change {
+                } else {
                     rightLines[number - 1] = row.left
                 }
             }
         }
+        finishHunk(&document, rightLines)
+    }
+
+    private func finishHunk(_ document: inout CompareDocument, _ rightLines: [String]) {
         document.rightText = rightLines.joined(separator: "\n")
         document.rows = TextDiff.rows(left: document.leftText, right: document.rightText, options: diffOptions())
         compare = document
         if let full = absolutePath(document.path) {
             try? document.rightText.write(toFile: full, atomically: true, encoding: .utf8)
         }
+    }
+
+    func replaceWorkingLine(_ number: Int, _ text: String) {
+        guard var document = compare, document.editable else { return }
+        var lines = document.rightText.components(separatedBy: "\n")
+        let index = number - 1
+        guard lines.indices.contains(index) else { return }
+        lines[index] = text
+        finishHunk(&document, lines)
     }
 
     func saveWorkingText(_ text: String) {
@@ -486,8 +553,27 @@ extension AppModel {
         await refresh()
     }
 
-    func merge(strategy: String, source: String, revisions: [Int], secondURL: String, secondRevision: String, depth: String, ignoreWhitespace: Bool, ignoreEOL: Bool, ignoreAncestry: Bool, recordOnly: Bool, dryRun: Bool) async {
-        guard let wc = selectedWorkingCopy else { return }
+    func ancestorLog(_ change: LogPathChange) async -> [LogEntry] {
+        guard let repo = selectedRepository else { return [] }
+        let target: String
+        if let wc = selectedWorkingCopy {
+            let relative = change.copyFromPath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            let full = URL(fileURLWithPath: wc.path).appendingPathComponent(relative).path
+            target = FileManager.default.fileExists(atPath: full) ? full : repositoryURL(repo, path: change.copyFromPath)
+        } else {
+            target = repositoryURL(repo, path: change.copyFromPath)
+        }
+        var args = ["log", "-v", "--xml", "-l", "40"]
+        if let revision = Int(change.copyFromRev), revision > 0 {
+            args.append(contentsOf: ["-r", "\(revision):1"])
+        }
+        args.append(target)
+        guard let output = await invoke(args: args, repo: repo, title: t("timeline.ancestor"), reportError: false), output.code == 0 else { return [] }
+        return SVNXML.log(output.stdout)
+    }
+
+    func merge(strategy: String, source: String, revisions: [Int], secondURL: String, secondRevision: String, depth: String, ignoreWhitespace: Bool, ignoreEOL: Bool, ignoreAncestry: Bool, recordOnly: Bool, dryRun: Bool) async -> String {
+        guard let wc = selectedWorkingCopy else { return "" }
         var args = ["merge"]
         if dryRun { args.append("--dry-run") }
         if !depth.isEmpty { args.append(contentsOf: ["--depth", depth]) }
@@ -497,7 +583,7 @@ extension AppModel {
         if recordOnly { args.append("--record-only") }
         switch strategy {
         case "cherry":
-            if revisions.isEmpty { return }
+            if revisions.isEmpty { return "" }
             args.append(contentsOf: ["-c", revisions.map(String.init).joined(separator: ",")])
             args.append(source)
         case "advanced":
@@ -510,8 +596,17 @@ extension AppModel {
             args.append(source)
         }
         args.append(wc.path)
+        if strategy == "cherry", let first = revisions.first, let last = revisions.last {
+            operationLeft = String(max(first - 1, 0))
+            operationRight = String(last)
+        } else {
+            operationLeft = "BASE"
+            operationRight = "HEAD"
+        }
         _ = await invoke(args: args, cwd: URL(fileURLWithPath: wc.path), repo: repository(for: wc), title: t("action.merge"))
+        let preview = lastStdout
         if !dryRun { await refresh() }
+        return preview
     }
 
     func branchOrTag(isTag: Bool, name: String, location: String, revision: String, message: String) async {
@@ -684,6 +779,32 @@ extension AppModel {
         await loadInspector(path: full)
     }
 
+    func revertPropertyToBase(_ name: String) async {
+        guard let wc = selectedWorkingCopy, let relative = selectedPaths.first else { return }
+        let full = URL(fileURLWithPath: wc.path).appendingPathComponent(relative).path
+        let output = await invoke(args: ["propget", name, full, "-r", "BASE"], repo: repository(for: wc), title: t("action.revert"), reportError: false)
+        let value = String(data: output?.stdout ?? Data(), encoding: .utf8)?.trimmingCharacters(in: .newlines) ?? ""
+        if output?.code == 0 {
+            await setProperty(name, value: value, path: relative)
+        } else {
+            await setProperty(name, value: nil, path: relative)
+        }
+    }
+
+    func rememberDefaultApp() {
+        guard let file = selectedFileURL() else { return }
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowedContentTypes = [.application]
+        panel.directoryURL = URL(fileURLWithPath: "/Applications")
+        panel.prompt = t("inspector.openWith")
+        guard panel.runModal() == .OK, let app = panel.url,
+              let type = UTType(filenameExtension: file.pathExtension)?.identifier as CFString?,
+              let bundle = Bundle(url: app)?.bundleIdentifier as CFString? else { return }
+        LSSetDefaultRoleHandlerForContentType(type, .all, bundle)
+    }
+
     func deleteProperty(_ name: String) async {
         guard let wc = selectedWorkingCopy, let relative = selectedPaths.first else { return }
         let full = URL(fileURLWithPath: wc.path).appendingPathComponent(relative).path
@@ -699,8 +820,10 @@ extension AppModel {
             library.save(repo: repo)
             reloadLists()
         }
-        KeychainStore.save(account: keychainAccount(repo, name), secret: password)
-        KeychainStore.save(account: repo.id, secret: password)
+        if preferences.savePasswords {
+            KeychainStore.save(account: keychainAccount(repo, name), secret: password)
+            KeychainStore.save(account: repo.id, secret: password)
+        }
         sheet = nil
         let reopenLog = mode == .log || mode == .timeline
         Task {
@@ -728,6 +851,13 @@ extension AppModel {
             return rows.first { $0.movedFrom == row.path }?.path ?? ""
         }
         return ""
+    }
+
+    private func propertyText(full: String, revision: String, wc: WCRecord) async -> String {
+        var args = ["proplist", full, "-v", "--xml"]
+        if revision != "WORKING" { args.append(contentsOf: ["-r", revision]) }
+        guard let output = await invoke(args: args, repo: repository(for: wc), title: t("inspector.properties"), reportError: false, record: false), output.code == 0 else { return "" }
+        return SVNXML.properties(output.stdout).map { "\($0.name) = \($0.value)" }.sorted().joined(separator: "\n")
     }
 
     private func propertiesValue(_ name: String, path: String) -> String {
